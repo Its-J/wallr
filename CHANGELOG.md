@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0
+
+- **Do less work**: static wallpapers submit once and sleep; transitions run only for their wall-clock duration; video/GIF loops pace to frame boundaries instead of the refresh rate. No render-loop wakeups when nothing changes.
+- **GPU resource sharing**: one shared sampler per use (static/video) instead of a new sampler per texture, and a per-format pipeline cache so the first frame per surface format pays for compilation exactly once.
+- **IPC hardening**: requests capped at 64 KiB, paths/monitors/durations validated before any decode or GPU work, malformed commands get an error response instead of a dropped connection.
+- **Path security**: package names are lexically contained in the registry (`..`, separators, absolute paths rejected); remote `owner/repo` refs restricted to safe characters.
+- **Daemon hot path**: the render-state map lock is held only to snapshot targets, never across decode/upload/theme work, so hotplug and concurrent IPC stay responsive. Transitions reconfigure a stale swapchain and continue instead of blanking.
+- **Real config reload**: `reload` re-reads config from disk, validates it, keeps the last good config on failure, and live-applies `hw_decode`/`preload_frames`/`max_fps` without rebuilding GPU state.
+- **Async theme pipeline**: wallpaper pixels appear first; hooks/theme/reload run detached with a generation counter so rapid A→B→C switches supersede obsolete theme work.
+- **Watcher**: reacts to create/modify/close-write (not just create), skips temp/hidden files, debounces per path, ignores partially-written files, and supports video extensions.
+- **Bounded video config**: `preload_frames` clamped to 1..=8 and `max_fps` to 1..=240 at creation and reload, keeping decoder queues bounded.
+
 ## 0.3.4
 
 - **`wallr install` now actually installs**: `wallr install <username/repo>` (or `github:username/repo`) downloads the package YAML from the repository root on GitHub, validates it, resolves its `extends` chain, and stores it at `~/.local/share/wallr/packages/<repo>/wallr.yaml`. The previous command only re-passed the reference to the local registry resolver and reported success without installing anything.

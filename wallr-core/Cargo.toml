@@ -6,8 +6,6 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Core library for wallr — wallpaper engine, animation system, theme provider dispatch, and package management."
-readme = "README.md"
-homepage.workspace = true
 categories.workspace = true
 keywords.workspace = true
 rust-version.workspace = true
@@ -37,7 +35,6 @@ serde_yaml.workspace = true
 
 # CLI
 clap.workspace = true
-colored.workspace = true
 
 # Async runtime
 tokio.workspace = true
@@ -67,14 +64,11 @@ wayland-backend.workspace = true
 # File operations
 notify.workspace = true
 dirs.workspace = true
-glob.workspace = true
-which.workspace = true
 tempfile = "3"
 
 # Utilities
 sha2.workspace = true
 hex.workspace = true
-humansize.workspace = true
 
 # Video support
 ffmpeg-next.workspace = true

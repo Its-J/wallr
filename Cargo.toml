@@ -3,13 +3,12 @@ members = ["wallr", "wallr-core"]
 resolver = "2"
 
 [workspace.package]
-version = "0.3.4"
+version = "0.4.0"
 edition = "2024"
 authors = ["Wallr Contributors"]
 license = "MIT"
 repository = "https://github.com/programmersd21/wallr"
 description = "The wallpaper engine for Wayland — animated transitions, theme pipeline integration, and a package ecosystem."
-homepage = "https://github.com/programmersd21/wallr"
 categories = ["command-line-utilities", "rendering"]
 keywords = ["wallpaper", "wayland", "wgpu", "daemon", "matugen"]
 rust-version = "1.85"
@@ -38,7 +37,7 @@ strip = false
 opt-level = 2 # Optimize dependencies even in dev mode
 
 [workspace.dependencies]
-wallr-core = { path = "wallr-core", version = "0.3.4" }
+wallr-core = { path = "wallr-core", version = "0.4.0" }
 
 # Core utilities
 anyhow = "1"
@@ -104,8 +103,6 @@ wayland-backend = { version = "0.3", features = ["client_system"] }
 humansize = "2"
 notify = { version = "7", default-features = false }
 dirs = "6"
-glob = "0.3"
-which = "7"
 
 # Crypto & utilities
 sha2 = { version = "0.10", default-features = false }

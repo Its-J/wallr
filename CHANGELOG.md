@@ -1,6 +1,7 @@
 # Changelog
 
-## 0.4.0
+## 0.4.0 — 2026-09-15
+Planned Sep 12-14, implemented Sep 15
 
 - **Do less work**: static wallpapers submit once and sleep; transitions run only for their wall-clock duration; video/GIF loops pace to frame boundaries instead of the refresh rate. No render-loop wakeups when nothing changes.
 - **GPU resource sharing**: one shared sampler per use (static/video) instead of a new sampler per texture, and a per-format pipeline cache so the first frame per surface format pays for compilation exactly once.

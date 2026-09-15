@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name for release (e.g. v0.3.3)'
+        description: 'Tag name for release (e.g. v0.4.0)'
         required: false
         type: string
 
@@ -42,41 +42,41 @@ jobs:
             ninja-build \
             nasm
 
-      - name: Cache vcpkg (binary cache, installed, sources)
-        id: vcpkg-cache
+      - name: Cache vcpkg binary archives (files provider)
+        # x-gha was removed from vcpkg in April 2025 (microsoft/vcpkg-tool#1662).
+        # The recommended replacement for GitHub Actions is a filesystem cache
+        # via VCPKG_BINARY_SOURCES=clear;files,<path>,readwrite + actions/cache
+        # on that path. We cache the archives (per-port zip files) in the
+        # workspace — not inside /opt/vcpkg — so a fresh `git clone` of the
+        # tool doesn't wipe the cache.
         uses: actions/cache@v4
         with:
-          path: |
-            /opt/vcpkg/installed
-            /opt/vcpkg/downloads
-            /opt/vcpkg/bincache
-          # Includes the manifest hash so a triplet/feature-list change (edits
-          # to .github/vcpkg-triplets or the ffmpeg feature string below)
-          # correctly busts the cache instead of restoring a stale build.
-          key: vcpkg-${{ env.VCPKG_COMMIT }}-static-ffmpeg-${{ hashFiles('.github/vcpkg-triplets/**') }}
+          path: ${{ github.workspace }}/.vcpkg-cache
+          key: wallr-vcpkg-archives-${{ runner.os }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('.github/vcpkg-triplets/**') }}
           restore-keys: |
-            vcpkg-${{ env.VCPKG_COMMIT }}-static-ffmpeg-
-            vcpkg-${{ env.VCPKG_COMMIT }}-
-            vcpkg-static-ffmpeg-
+            wallr-vcpkg-archives-${{ runner.os }}-${{ env.VCPKG_COMMIT }}-
+            wallr-vcpkg-archives-${{ runner.os }}-
 
       - name: Install vcpkg
         run: |
-          git clone --depth 1 --branch master https://github.com/microsoft/vcpkg /opt/vcpkg
-          git -C /opt/vcpkg fetch --depth 1 origin "$VCPKG_COMMIT"
-          git -C /opt/vcpkg checkout "$VCPKG_COMMIT"
+          if [ -d /opt/vcpkg/.git ]; then
+            echo "vcpkg already present from cache — updating"
+            git -C /opt/vcpkg fetch --depth 1 origin "$VCPKG_COMMIT"
+            git -C /opt/vcpkg checkout "$VCPKG_COMMIT"
+          else
+            sudo rm -rf /opt/vcpkg
+            git clone --depth 1 --branch master https://github.com/microsoft/vcpkg /opt/vcpkg
+            git -C /opt/vcpkg fetch --depth 1 origin "$VCPKG_COMMIT"
+            git -C /opt/vcpkg checkout "$VCPKG_COMMIT"
+          fi
           /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
       - name: Build static FFmpeg
         env:
           VCPKG_ROOT: /opt/vcpkg
-          VCPKG_DEFAULT_BINARY_CACHE: /opt/vcpkg/bincache
+          VCPKG_BINARY_SOURCES: "clear;files,${{ github.workspace }}/.vcpkg-cache,readwrite"
         run: |
-          mkdir -p /opt/vcpkg/bincache
-          if [ "${{ steps.vcpkg-cache.outputs.cache-hit }}" = "true" ]; then
-            echo "Exact vcpkg cache hit — running install to verify, should be a fast no-op."
-          else
-            echo "No exact vcpkg cache hit — full or partial FFmpeg build expected."
-          fi
+          mkdir -p "${{ github.workspace }}/.vcpkg-cache"
           /opt/vcpkg/vcpkg install \
             'ffmpeg[core,avcodec,avformat,swscale,swresample]:x64-linux-static' \
             --overlay-triplets="$GITHUB_WORKSPACE/.github/vcpkg-triplets"

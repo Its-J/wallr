@@ -15,10 +15,20 @@ pub struct Renderer {
     pub bind_group_layout_uni: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     shader: wgpu::ShaderModule,
-    /// Cached pipeline for a specific surface format. Created lazily.
-    pipeline: std::sync::Mutex<Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>>,
+    /// Lazily created pipelines keyed by surface format. Key space is the
+    /// finite `wgpu::TextureFormat` enum; in practice 1-2 entries (one per
+    /// distinct surface format across outputs). Never created in the frame
+    /// hot path more than once per format.
+    pipeline:
+        std::sync::Mutex<std::collections::HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>>,
     nv12_bind_group_layout: wgpu::BindGroupLayout,
     nv12_pipeline: wgpu::RenderPipeline,
+    /// Shared samplers. Previously a new sampler was created per texture
+    /// upload; samplers are immutable and cheap to share, so one per use
+    /// lives as long as the renderer.
+    static_sampler: wgpu::Sampler,
+    video_plane_sampler: wgpu::Sampler,
+    video_output_sampler: wgpu::Sampler,
 }
 
 pub struct VideoTexture {
@@ -312,6 +322,37 @@ impl Renderer {
             cache: None,
         });
 
+        let static_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("wallr static sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let video_plane_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Video Plane Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let video_output_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Video Output Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
         Ok(Self {
             instance,
             adapter,
@@ -321,9 +362,12 @@ impl Renderer {
             shader,
             bind_group_layout_tex,
             bind_group_layout_uni,
-            pipeline: std::sync::Mutex::new(None),
+            pipeline: std::sync::Mutex::new(std::collections::HashMap::new()),
             nv12_bind_group_layout,
             nv12_pipeline,
+            static_sampler,
+            video_plane_sampler,
+            video_output_sampler,
         })
     }
 
@@ -368,9 +412,11 @@ impl Renderer {
     }
 
     fn get_pipeline(&self, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
-        let mut cache = self.pipeline.lock().unwrap();
-        if let Some((cached_fmt, ref pipeline)) = *cache
-            && cached_fmt == format
+        // Fast path: reuse an already-created pipeline for this format.
+        // Only the first frame per format pays for pipeline creation, and
+        // creation never happens more than once per distinct format.
+        if let Ok(cache) = self.pipeline.lock().as_deref()
+            && let Some(pipeline) = cache.get(&format)
         {
             return pipeline.clone();
         }
@@ -415,7 +461,14 @@ impl Renderer {
                 cache: None,
             });
 
-        *cache = Some((format, pipeline.clone()));
+        // Insert under lock; a concurrent first-frame for the same format
+        // may have inserted first, in which case keep the existing entry.
+        if let Ok(mut cache) = self.pipeline.lock() {
+            cache.entry(format).or_insert_with(|| pipeline.clone());
+            if let Some(existing) = cache.get(&format) {
+                return existing.clone();
+            }
+        }
         pipeline
     }
 
@@ -444,15 +497,6 @@ impl Renderer {
         });
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &self.bind_group_layout_tex,
             entries: &[
@@ -462,7 +506,7 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
+                    resource: wgpu::BindingResource::Sampler(&self.static_sampler),
                 },
             ],
             label: None,
@@ -541,26 +585,6 @@ impl Renderer {
                 | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Video Plane Sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-        let output_sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Video Output Sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
         let conversion = YuvConversion::new(YuvColorInfo {
             matrix: YuvMatrix::Bt709,
             range: YuvRange::Limited,
@@ -589,7 +613,7 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
+                    resource: wgpu::BindingResource::Sampler(&self.video_plane_sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -607,7 +631,7 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&output_sampler),
+                    resource: wgpu::BindingResource::Sampler(&self.video_output_sampler),
                 },
             ],
         });

@@ -36,7 +36,7 @@
 - **Behavior**: Binds to Wayland display server, registers a full-screen background surface per output, handles `scale_factor_changed` and `configure` events dynamically, and sets `wl_surface.set_buffer_scale(scale_factor)` for crisp 1:1 physical pixel rendering on 4K and HiDPI displays.
 - **Per-monitor**: Each Wayland output gets its own `LayerSurface`, wgpu `Surface`, and `RenderState`, stored in a `HashMap<String, Arc<Mutex<RenderState>>>` keyed by output name (e.g. `DP-1`, `HDMI-A-1`). Output names are resolved via `wl_output` v4; compositors that don't provide names fall back to make/model or a generated ID. The daemon performs 5 roundtrips at startup to ensure all outputs are discovered, even on compositors that deliver output events lazily.
 
-### 2. GPU Rendering Pipeline (`wgpu`)
+### 2a. GPU Rendering Pipeline (`wgpu`)
 - **Backend**: Vulkan / OpenGL / Metal (via `wgpu` abstraction)
 - **Shader Pipeline**: Single-pass WGSL shader (`effects.wgsl`)
 - **Uniform Buffer**: Tracks separate old/new image aspect ratios, screen resolution, animation progress (`0.0..1.0`), active effect type index (`fade`, `blur`, `wipe`, `slide`, `zoom`, `pixelate`, `ripple`, `dissolve`, `wave`, `grow`, `outer`), effect parameters (`param_a` to `param_d`), effect origin (`origin`), travel direction (`direction`), easing mode (`easing`: `0` linear, `1` ease-in, `2` ease-out, `3` ease-in-out), and scaling mode (`scaling_mode`: `0` fill, `1` fit, `2` stretch, `3` center, `4` tile). Struct is 80 bytes (`Vec2`-aligned, size padded for WGSL uniform layout).
@@ -55,6 +55,7 @@ Every transition (from a YAML package, `wallr set --effect ...`, or the preview 
 CLI --effect/--origin/--angle/--easing/...   ┐
 YAML animation package (first effect)        ├─► Effect ─► compute_effect_uniforms ─► EffectUniforms ─► WGSL
 PreviewWindow (same Effect type)             ┘
+```
 
 ### 3. Daemon & Unix IPC Server (`tokio`)
 - **Socket**: `$XDG_RUNTIME_DIR/wallr.sock` (configurable)

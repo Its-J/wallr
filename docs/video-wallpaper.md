@@ -40,7 +40,7 @@ wallpaper:
 video:
   hw_decode: "auto"          # auto, vaapi, nvdec, software
   preferred_gpu: "auto"      # auto, integrated, discrete, or adapter name
-  preload_frames: 2          # frames decoded ahead of the playhead
+  preload_frames: 2          # frames decoded ahead of the playhead (1..=8)
 ```
 
 ## Requirements

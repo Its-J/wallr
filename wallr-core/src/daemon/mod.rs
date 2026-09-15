@@ -246,8 +246,9 @@ fn viewport_destination(configured: (u32, u32), physical: (u32, u32)) -> Option<
 #[cfg(test)]
 mod viewport_tests {
     use super::{
-        VideoPresentAction, is_transient_wallpaper_error, persist_wallpaper_at,
-        read_wallpaper_state, video_present_action, viewport_destination, write_wallpaper_state,
+        VideoPresentAction, clamp_max_fps, clamp_preload_frames, is_transient_wallpaper_error,
+        is_usable_wallpaper_file, is_watch_candidate, persist_wallpaper_at, read_wallpaper_state,
+        validate_live_config, video_present_action, viewport_destination, write_wallpaper_state,
     };
     use crate::renderer::FrameStatus;
 
@@ -361,6 +362,60 @@ mod viewport_tests {
         assert!(!is_transient_wallpaper_error(&anyhow::anyhow!(
             "invalid dimensions"
         )));
+    }
+
+    #[test]
+    fn live_video_params_stay_bounded() {
+        assert_eq!(clamp_preload_frames(0), 1);
+        assert_eq!(clamp_preload_frames(2), 2);
+        assert_eq!(clamp_preload_frames(100), 8);
+        assert_eq!(clamp_max_fps(None), None);
+        assert_eq!(clamp_max_fps(Some(0)), None);
+        assert_eq!(clamp_max_fps(Some(60)), Some(60));
+        assert_eq!(clamp_max_fps(Some(10_000)), Some(240));
+    }
+
+    #[test]
+    fn watcher_ignores_temp_files_and_unknown_extensions() {
+        assert!(is_watch_candidate(std::path::Path::new(
+            "/watch/sunset.jpg"
+        )));
+        assert!(is_watch_candidate(std::path::Path::new("/watch/clip.mp4")));
+        assert!(!is_watch_candidate(std::path::Path::new(
+            "/watch/.hidden.jpg"
+        )));
+        assert!(!is_watch_candidate(std::path::Path::new("/watch/edit.swp")));
+        assert!(!is_watch_candidate(std::path::Path::new(
+            "/watch/notes.txt"
+        )));
+        assert!(!is_watch_candidate(std::path::Path::new(
+            "/watch/photo.jpg.tmp"
+        )));
+    }
+
+    #[test]
+    fn watcher_requires_non_empty_files() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let empty = temporary.path().join("empty.jpg");
+        let filled = temporary.path().join("filled.jpg");
+        std::fs::write(&empty, b"").expect("empty file");
+        std::fs::write(&filled, b"data").expect("filled file");
+        assert!(!is_usable_wallpaper_file(&empty));
+        assert!(is_usable_wallpaper_file(&filled));
+        assert!(!is_usable_wallpaper_file(
+            &temporary.path().join("missing.jpg")
+        ));
+    }
+
+    #[test]
+    fn reload_rejects_absurd_live_values() {
+        let mut cfg = crate::config::WallrConfig::default();
+        assert!(validate_live_config(&cfg).is_ok());
+        cfg.video.preload_frames = 1000;
+        assert!(validate_live_config(&cfg).is_err());
+        cfg.video.preload_frames = 2;
+        cfg.daemon.max_fps = Some(0);
+        assert!(validate_live_config(&cfg).is_err());
     }
 }
 
@@ -1216,8 +1271,32 @@ fn render_transition(
                 break;
             }
         };
-        if progress >= 1.0 || status != crate::renderer::FrameStatus::Presented {
+        if progress >= 1.0 {
             break;
+        }
+        match status {
+            crate::renderer::FrameStatus::Presented => {}
+            // A stalled compositor parks inside `get_current_texture`; a
+            // timeout just means "try the next vsync" without breaking the
+            // wall-clock duration.
+            crate::renderer::FrameStatus::TimedOut => {}
+            // The swapchain is stale (resize, scale, recreation). Reconfigure
+            // once and continue the transition instead of blanking.
+            crate::renderer::FrameStatus::Outdated | crate::renderer::FrameStatus::Lost => {
+                surface.configure(
+                    &renderer.device,
+                    &wgpu::SurfaceConfiguration {
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                        format: commit.format,
+                        width: commit.width.max(1),
+                        height: commit.height.max(1),
+                        present_mode: wgpu::PresentMode::Fifo,
+                        alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+                        view_formats: vec![],
+                        desired_maximum_frame_latency: 2,
+                    },
+                );
+            }
         }
     }
 
@@ -1664,6 +1743,124 @@ fn resolve_named_targets(
     }
 }
 
+type RenderStateMap = std::collections::HashMap<String, Arc<Mutex<RenderState>>>;
+type SharedRenderStates = std::sync::Arc<tokio::sync::Mutex<RenderStateMap>>;
+
+/// Snapshot target states while holding the map lock briefly, then drop the
+/// guard before any decode, GPU, or theme work. Holding the map lock across
+/// long operations would block hotplug insert/remove and other IPC commands.
+async fn snapshot_targets(
+    map: &SharedRenderStates,
+    monitor: Option<&str>,
+) -> Vec<Arc<Mutex<RenderState>>> {
+    let states = map.lock().await;
+    resolve_targets(&states, monitor).await
+}
+
+async fn snapshot_named_targets(
+    map: &SharedRenderStates,
+    monitor: Option<&str>,
+) -> Vec<(String, Arc<Mutex<RenderState>>)> {
+    let states = map.lock().await;
+    resolve_named_targets(&states, monitor)
+}
+
+async fn snapshot_all_named(map: &SharedRenderStates) -> Vec<(String, Arc<Mutex<RenderState>>)> {
+    let states = map.lock().await;
+    states
+        .iter()
+        .map(|(name, state)| (name.clone(), state.clone()))
+        .collect()
+}
+
+/// Caps for live-applied configuration. Keeps queues bounded and prevents
+/// absurd scheduling values from IPC or config reload.
+pub(crate) fn clamp_preload_frames(requested: usize) -> usize {
+    requested.clamp(1, 8)
+}
+
+pub(crate) fn clamp_max_fps(requested: Option<u32>) -> Option<u32> {
+    match requested {
+        Some(0) | None => None,
+        Some(fps) => Some(fps.clamp(1, 240)),
+    }
+}
+
+/// Returns true when `path` looks like a usable wallpaper file: exists, is a
+/// file, and has non-zero size. Used by the watcher and IPC to avoid decoding
+/// partially-written files.
+fn is_usable_wallpaper_file(path: &std::path::Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
+}
+
+/// Whether a filesystem-watch event path is worth considering: supported
+/// extension and not an editor/temporary file.
+fn is_watch_candidate(path: &std::path::Path) -> bool {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if file_name.is_empty()
+        || file_name.starts_with('.')
+        || file_name.ends_with('~')
+        || file_name.ends_with(".tmp")
+        || file_name.ends_with(".part")
+        || file_name.ends_with(".swp")
+        || file_name.ends_with(".swx")
+    {
+        return false;
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        ext.as_str(),
+        "jpg"
+            | "jpeg"
+            | "png"
+            | "gif"
+            | "webp"
+            | "avif"
+            | "mp4"
+            | "webm"
+            | "mkv"
+            | "mov"
+            | "avi"
+            | "m4v"
+    )
+}
+
+/// Validates a freshly loaded config before it replaces the live one.
+/// Only checks values applied at runtime; unknown future keys are ignored by
+/// serde defaults and never fail reload.
+fn validate_live_config(cfg: &WallrConfig) -> Result<(), String> {
+    if cfg.video.preload_frames > 64 {
+        return Err(format!(
+            "video.preload_frames {} exceeds maximum 64",
+            cfg.video.preload_frames
+        ));
+    }
+    if let Some(fps) = cfg.daemon.max_fps
+        && (fps == 0 || fps > 1000)
+    {
+        return Err(format!("daemon.max_fps {fps} out of range 1..=1000"));
+    }
+    crate::config::parse_duration(&cfg.animation.duration)
+        .map_err(|e| format!("animation.duration invalid: {e}"))?;
+    if cfg.watch.enabled
+        && let Some(ref dir) = cfg.watch.dir
+    {
+        if dir.is_empty() || dir.len() > 8192 {
+            return Err("watch.dir has invalid length".to_string());
+        }
+        crate::config::parse_duration(&cfg.watch.debounce)
+            .map_err(|e| format!("watch.debounce invalid: {e}"))?;
+    }
+    Ok(())
+}
+
 pub struct Daemon {
     config: WallrConfig,
     paused: Arc<AtomicBool>,
@@ -1845,6 +2042,11 @@ impl Daemon {
         let paused_clone = self.paused.clone();
         let engine_clone = self.engine.clone();
         let render_states_clone = render_states.clone();
+        // Generation counter for theme/hook work. Rapid A→B→C switches bump
+        // the counter; detached theme tasks with a stale generation exit
+        // without invoking external processes for obsolete wallpapers.
+        let theme_gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let theme_gen_clone = theme_gen.clone();
 
         // Graceful shutdown on POSIX signals: stop video decoding, remove the
         // IPC socket, and exit. The compositor releases the layer-shell
@@ -1879,13 +2081,14 @@ impl Daemon {
         start_ipc_server(&socket_path, move |cmd| {
             let paused = paused_clone.clone();
             let engine = engine_clone.clone();
-            let render_states = render_states_clone.clone();
+            let render_states_map = render_states_clone.clone();
+            let theme_gen = theme_gen_clone.clone();
             let stop_socket = ipc_socket_path.clone();
             async move {
-                let render_states = render_states.lock().await;
                 match cmd {
                     IpcCommand::Pause { monitor } => {
-                        let targets = resolve_targets(&render_states, monitor.as_deref()).await;
+                        let targets =
+                            snapshot_targets(&render_states_map, monitor.as_deref()).await;
                         if targets.is_empty() {
                             return IpcResponse {
                                 success: false,
@@ -1906,7 +2109,8 @@ impl Daemon {
                         }
                     }
                     IpcCommand::Resume { monitor } => {
-                        let targets = resolve_targets(&render_states, monitor.as_deref()).await;
+                        let targets =
+                            snapshot_targets(&render_states_map, monitor.as_deref()).await;
                         if targets.is_empty() {
                             return IpcResponse {
                                 success: false,
@@ -1927,16 +2131,51 @@ impl Daemon {
                         }
                     }
                     IpcCommand::Reload => {
-                        let lock = engine.lock().await;
-                        match lock.reload() {
-                            Ok(_) => IpcResponse {
-                                success: true,
-                                message: Some("Reloaded".into()),
-                            },
-                            Err(e) => IpcResponse {
-                                success: false,
-                                message: Some(e.to_string()),
-                            },
+                        // Re-read config from disk, validate, and apply live
+                        // values without rebuilding GPU state. Invalid configs
+                        // keep the previous valid configuration.
+                        let fresh = crate::config::load_config(None)
+                            .map_err(|e| e.to_string())
+                            .and_then(|cfg| {
+                                validate_live_config(&cfg)?;
+                                Ok(cfg)
+                            });
+                        let fresh = match fresh {
+                            Ok(cfg) => cfg,
+                            Err(reason) => {
+                                return IpcResponse {
+                                    success: false,
+                                    message: Some(format!("Reload rejected: {reason}")),
+                                };
+                            }
+                        };
+                        let preload = clamp_preload_frames(fresh.video.preload_frames);
+                        let max_fps = clamp_max_fps(fresh.daemon.max_fps);
+                        let hw_accel =
+                            crate::video::HwAccel::from_config(&fresh.video.hw_decode);
+                        {
+                            let mut eng = engine.lock().await;
+                            eng.config = fresh.clone();
+                            if let Err(e) = eng.reload() {
+                                return IpcResponse {
+                                    success: false,
+                                    message: Some(e.to_string()),
+                                };
+                            }
+                        }
+                        // Apply video params per output without holding the
+                        // map lock across awaits.
+                        let targets = snapshot_all_named(&render_states_map).await;
+                        for (_, rs) in targets {
+                            let mut rs_lock = rs.lock().await;
+                            rs_lock.hw_accel = hw_accel;
+                            rs_lock.preload_frames = preload;
+                            rs_lock.max_fps = max_fps;
+                        }
+                        let _ = theme_gen;
+                        IpcResponse {
+                            success: true,
+                            message: Some("Reloaded".into()),
                         }
                     }
                     IpcCommand::Preview {
@@ -1955,15 +2194,18 @@ impl Daemon {
                             };
                         }
                         let p = std::path::PathBuf::from(&path);
-                        if !p.exists() {
+                        if !is_usable_wallpaper_file(&p) {
                             return IpcResponse {
                                 success: false,
-                                message: Some(format!("File not found: {}", path)),
+                                message: Some(format!("File not found or unreadable: {}", path)),
                             };
                         }
 
-                        // Resolve targets: unknown monitor = error, no monitor = all outputs.
-                        let targets = resolve_named_targets(&render_states, monitor.as_deref());
+                        // Snapshot targets first, then drop the map lock
+                        // before any decode/upload work so hotplug stays
+                        // responsive while a switch is in flight.
+                        let targets =
+                            snapshot_named_targets(&render_states_map, monitor.as_deref()).await;
                         if targets.is_empty() {
                             return IpcResponse {
                                 success: false,
@@ -1981,7 +2223,9 @@ impl Daemon {
                         // videos an unrequested 2s fade reads as a long "load".
                         // Default to a short fade unless the user asked for one.
                         let is_video = crate::video::VideoDecoder::is_video_file(&p);
-                        let duration = duration_ms.unwrap_or(if is_video { 150 } else { 2000 });
+                        let duration = duration_ms
+                            .unwrap_or(if is_video { 150 } else { 2000 })
+                            .min(crate::ipc::MAX_DURATION_MS);
                         let sm = scaling_mode.unwrap_or(crate::config::ScalingMode::Fill);
                         let scaling_mode_u32 = match sm {
                             crate::config::ScalingMode::Fill => 0u32,
@@ -2020,29 +2264,47 @@ impl Daemon {
                                 message: Some(e),
                             },
                             None => {
+                                // Wallpaper is already visible at this point.
+                                // Theme/hooks/reload run detached so they never
+                                // block the next switch. Rapid A→B→C switches
+                                // supersede queued theme work via the
+                                // generation counter.
+                                let generation =
+                                    theme_gen.fetch_add(1, Ordering::SeqCst) + 1;
                                 let opts = SetOptions {
                                     no_theme,
                                     theme_provider: theme_override,
                                     monitor,
                                 };
-                                let mut eng = engine.lock().await;
-                                match eng.set_wallpaper(&p, &opts).await {
-                                    Ok(()) => IpcResponse {
-                                        success: true,
-                                        message: None,
-                                    },
-                                    Err(e) => IpcResponse {
-                                        success: true,
-                                        message: Some(format!(
-                                            "Wallpaper set, but hooks/theme failed: {e}"
-                                        )),
-                                    },
+                                let eng = engine.clone();
+                                let theme_gen_check = theme_gen.clone();
+                                let p_clone = p.clone();
+                                tokio::spawn(async move {
+                                    if theme_gen_check.load(Ordering::SeqCst) != generation {
+                                        return;
+                                    }
+                                    let mut eng = eng.lock().await;
+                                    if theme_gen_check.load(Ordering::SeqCst) != generation {
+                                        return;
+                                    }
+                                    if let Err(e) =
+                                        eng.set_wallpaper(&p_clone, &opts).await
+                                    {
+                                        tracing::warn!(
+                                            "Post-render hooks/theme failed for {p_clone:?}: {e}"
+                                        );
+                                    }
+                                });
+                                IpcResponse {
+                                    success: true,
+                                    message: None,
                                 }
                             }
                         }
                     }
                     IpcCommand::Stop => {
-                        for rs in render_states.values() {
+                        let targets = snapshot_all_named(&render_states_map).await;
+                        for (_, rs) in targets {
                             let state = rs.lock().await;
                             state.playback_gen.fetch_add(1, Ordering::SeqCst);
                             state.pacer.notify();
@@ -2074,7 +2336,8 @@ impl Daemon {
                         timestamp_ms,
                         monitor,
                     } => {
-                        let targets = resolve_targets(&render_states, monitor.as_deref()).await;
+                        let targets =
+                            snapshot_named_targets(&render_states_map, monitor.as_deref()).await;
                         if targets.is_empty() {
                             return IpcResponse {
                                 success: false,
@@ -2084,13 +2347,12 @@ impl Daemon {
                                 },
                             };
                         }
-                        // When monitor is unspecified, seek all outputs
+                        // When monitor is unspecified, seek all outputs.
+                        // The map lock was already dropped; work only on the
+                        // snapshot so hotplug stays responsive.
                         let mut seek_count = 0u32;
                         let mut errors = Vec::new();
-                        for (name, rs) in render_states.iter() {
-                            if monitor.as_deref() != Some(name.as_str()) && monitor.is_some() {
-                                continue;
-                            }
+                        for (name, rs) in &targets {
                             let rs_lock = rs.lock().await;
                             match rs_lock
                                 .video_playback
@@ -2134,7 +2396,8 @@ impl Daemon {
                         }
                     }
                     IpcCommand::Info { monitor } => {
-                        let targets = resolve_targets(&render_states, monitor.as_deref()).await;
+                        let targets =
+                            snapshot_named_targets(&render_states_map, monitor.as_deref()).await;
                         if targets.is_empty() {
                             return IpcResponse {
                                 success: false,
@@ -2148,17 +2411,14 @@ impl Daemon {
                         let mut lines = vec![
                             format!("wallr v{}", env!("CARGO_PKG_VERSION")),
                             String::new(),
-                            format!("Outputs: {}", render_states.len()),
+                            format!("Outputs: {}", targets.len()),
                         ];
-                        for name in render_states.keys() {
+                        for (name, _) in &targets {
                             lines.push(format!("  - {name}"));
                         }
 
                         // Collect target output info
-                        for (name, rs) in render_states.iter() {
-                            if monitor.is_some() && monitor.as_deref() != Some(name.as_str()) {
-                                continue;
-                            }
+                        for (name, rs) in &targets {
                             let rs_lock = rs.lock().await;
                             let gpu_info =
                                 crate::video::gpu::adapter_diagnostics(&rs_lock.renderer.adapter);
@@ -2225,8 +2485,9 @@ impl Daemon {
                         }
                     }
                     IpcCommand::MonitorList => {
+                        let targets = snapshot_all_named(&render_states_map).await;
                         let mut lines = Vec::new();
-                        for (name, rs) in render_states.iter() {
+                        for (name, rs) in &targets {
                             let lock = rs.lock().await;
                             lines.push(format!("{}: {}x{}", name, lock.width, lock.height));
                         }
@@ -2244,7 +2505,8 @@ impl Daemon {
                     }
                     IpcCommand::MonitorCurrent => {
                         // Return info for the first output as "current".
-                        if let Some((name, rs)) = render_states.iter().next() {
+                        let targets = snapshot_all_named(&render_states_map).await;
+                        if let Some((name, rs)) = targets.first() {
                             let lock = rs.lock().await;
                             IpcResponse {
                                 success: true,
@@ -2262,7 +2524,8 @@ impl Daemon {
                         effect,
                         duration_ms,
                     } => {
-                        let targets = resolve_named_targets(&render_states, monitor.as_deref());
+                        let targets =
+                            snapshot_named_targets(&render_states_map, monitor.as_deref()).await;
                         if targets.is_empty() {
                             return IpcResponse {
                                 success: false,
@@ -2351,7 +2614,8 @@ impl Daemon {
                         effect,
                         duration_ms,
                     } => {
-                        let targets = resolve_targets(&render_states, monitor.as_deref()).await;
+                        let targets =
+                            snapshot_named_targets(&render_states_map, monitor.as_deref()).await;
                         if targets.is_empty() {
                             return IpcResponse {
                                 success: false,
@@ -2366,12 +2630,9 @@ impl Daemon {
                         let restore_effect = effect.unwrap_or_else(|| {
                             crate::animation::Effect::Fade(crate::animation::FadeParams::default())
                         });
-                        let duration = duration_ms.unwrap_or(800);
+                        let duration = duration_ms.unwrap_or(800).min(crate::ipc::MAX_DURATION_MS);
 
-                        for (name, rs) in render_states.iter() {
-                            if monitor.as_deref() != Some(name.as_str()) && monitor.is_some() {
-                                continue;
-                            }
+                        for (name, rs) in &targets {
                             let rs = Arc::clone(rs);
                             let restore_effect = restore_effect.clone();
                             let result = tokio::task::spawn_blocking(move || {
@@ -2470,9 +2731,13 @@ impl Daemon {
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
 
         let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-            if let Ok(event) = res
-                && let EventKind::Create(_) = event.kind
-            {
+            // React to new files, content modifications, and close-after-write
+            // (atomic saves). Pure access/remove events carry no new pixels.
+            let Ok(event) = res else { return };
+            // Create covers new files, Modify covers content/rename saves.
+            // Access/Remove/Other carry no new pixels.
+            let relevant = matches!(&event.kind, EventKind::Create(_) | EventKind::Modify(_));
+            if relevant {
                 for path in event.paths {
                     let _ = tx.blocking_send(path);
                 }
@@ -2486,36 +2751,51 @@ impl Daemon {
 
         tokio::spawn(async move {
             let _watcher = watcher;
-            let mut last: Option<(PathBuf, std::time::Instant)> = None;
+            let mut last_seen: std::collections::HashMap<PathBuf, std::time::Instant> =
+                std::collections::HashMap::new();
 
             while let Some(path) = rx.recv().await {
                 if paused.load(Ordering::SeqCst) {
                     continue;
                 }
-                if let Some((ref lp, ref lt)) = last
-                    && lp == &path
-                    && lt.elapsed() < debounce
+                // Debounce bursts per path (editors/sync tools emit several
+                // events per save). Bound the map so a hostile directory
+                // cannot grow it without limit.
+                let now = std::time::Instant::now();
+                if let Some(seen) = last_seen.get(&path)
+                    && now.duration_since(*seen) < debounce
                 {
                     continue;
                 }
-                let ext = path
-                    .extension()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_lowercase();
-                if !["jpg", "jpeg", "png", "gif", "webp"].contains(&ext.as_str()) {
+                if last_seen.len() > 64 {
+                    last_seen.clear();
+                }
+                last_seen.insert(path.clone(), now);
+                if !is_watch_candidate(&path) {
                     continue;
                 }
-                last = Some((path.clone(), std::time::Instant::now()));
+                // The file may still be mid-write; skip this event and let
+                // the follow-up close/modify event deliver a usable file.
+                if !is_usable_wallpaper_file(&path) {
+                    continue;
+                }
 
-                // Apply new wallpaper to every connected output.
-                let states = render_states.lock().await;
-                for (name, rs) in states.iter() {
-                    let rs = rs.clone();
+                // Snapshot outputs, then release the map lock before decode.
+                let targets: Vec<(String, Arc<Mutex<RenderState>>)> = {
+                    let states = render_states.lock().await;
+                    states
+                        .iter()
+                        .map(|(name, rs)| (name.clone(), rs.clone()))
+                        .collect()
+                };
+                for (name, rs) in targets {
                     let eng = engine.clone();
                     let p = path.clone();
                     let name = name.clone();
                     tokio::spawn(async move {
+                        if !is_usable_wallpaper_file(&p) {
+                            return;
+                        }
                         let effect =
                             crate::animation::Effect::Fade(crate::animation::FadeParams::default());
                         if let Err(err) = set_wallpaper_with_retry(&rs, &p, &effect, 600, 0).await {
@@ -2652,8 +2932,8 @@ impl Daemon {
             format: surf_format,
             video_playback: std::sync::Arc::new(crate::video::VideoPlayback::new()),
             hw_accel: crate::video::HwAccel::from_config(&config.video.hw_decode),
-            preload_frames: config.video.preload_frames,
-            max_fps: config.daemon.max_fps,
+            preload_frames: clamp_preload_frames(config.video.preload_frames),
+            max_fps: clamp_max_fps(config.daemon.max_fps),
             scaling_mode: 0,
             per_output_uniforms: std::sync::Arc::new(renderer.create_per_output_uniforms()),
             last_wallpaper: None,
@@ -2766,8 +3046,8 @@ fn create_render_state_for_output_sync(
         format: surf_format,
         video_playback: std::sync::Arc::new(crate::video::VideoPlayback::new()),
         hw_accel: crate::video::HwAccel::from_config(&config.video.hw_decode),
-        preload_frames: config.video.preload_frames,
-        max_fps: config.daemon.max_fps,
+        preload_frames: clamp_preload_frames(config.video.preload_frames),
+        max_fps: clamp_max_fps(config.daemon.max_fps),
         scaling_mode: 0,
         per_output_uniforms: std::sync::Arc::new(renderer.create_per_output_uniforms()),
         last_wallpaper: None,

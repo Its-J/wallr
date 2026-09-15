@@ -44,7 +44,7 @@ impl PackageRegistry {
     }
 
     pub fn load_package(&self, name: &str) -> Result<Package, PackageError> {
-        let pkg_path = self.packages_dir.join(name);
+        let pkg_path = contained_package_path(&self.packages_dir, name)?;
         if !pkg_path.exists() {
             return Err(PackageError::NotFound(name.to_string()));
         }
@@ -149,14 +149,30 @@ pub fn resolve_extends(
 /// Parse a remote package reference, accepting either `username/repo` or the
 /// `github:username/repo` form used in `extends` lists.
 fn parse_remote_reference(reference: &str) -> Result<(String, String), PackageError> {
+    if reference.len() > 256 || reference.bytes().any(|b| b == 0) {
+        return Err(PackageError::InvalidReference(reference.to_string()));
+    }
     let stripped = reference.strip_prefix("github:").unwrap_or(reference);
     let parts: Vec<&str> = stripped.split('/').collect();
-    if parts.len() != 2
-        || parts
-            .iter()
-            .any(|part| part.is_empty() || part.contains('@'))
-        || parts.iter().any(|part| *part == "." || *part == "..")
-    {
+    fn valid_part(part: &str) -> bool {
+        if part.is_empty() || part.len() > 128 {
+            return false;
+        }
+        if part.contains('@') || part.contains('\\') || part.contains('\0') {
+            return false;
+        }
+        if part == "." || part == ".." {
+            return false;
+        }
+        if part.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return false;
+        }
+        // GitHub names allow alphanumerics, `-`, `_`, `.`; be slightly
+        // permissive but never allow path separators or parent components.
+        part.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    }
+    if parts.len() != 2 || !parts.iter().all(|p| valid_part(p)) {
         return Err(PackageError::InvalidReference(reference.to_string()));
     }
     Ok((parts[0].to_string(), parts[1].to_string()))
@@ -271,6 +287,37 @@ pub fn load_local_animation(path: &Path) -> Result<AnimationSpec, PackageError> 
     Ok(spec)
 }
 
+/// Joins a package `name` onto `packages_dir` without allowing escape.
+/// Rejects absolute paths, parent components, separators, and NUL bytes,
+/// then verifies the lexically-joined path stays within `packages_dir`.
+/// Symlinks are not followed here; the caller operates on the joined path
+/// and the OS resolves the final target at open time.
+fn contained_package_path(packages_dir: &Path, name: &str) -> Result<PathBuf, PackageError> {
+    if name.is_empty() || name.len() > 256 {
+        return Err(PackageError::InvalidReference(name.to_string()));
+    }
+    if name.bytes().any(|b| b == 0) {
+        return Err(PackageError::InvalidReference(name.to_string()));
+    }
+    let path = Path::new(name);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(PackageError::InvalidReference(name.to_string()));
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err(PackageError::InvalidReference(name.to_string()));
+    }
+    let joined = packages_dir.join(path);
+    // Lexical containment check (no string-prefix comparison).
+    if !joined.starts_with(packages_dir) {
+        return Err(PackageError::InvalidReference(name.to_string()));
+    }
+    Ok(joined)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,13 +373,51 @@ mod tests {
             ("programmersd21".to_string(), "wallr".to_string())
         );
         for bad in [
-            "", "single", "a/b/c", "a/", "/b", "@/repo", "a/b@c", "..", "../repo", ".",
+            "",
+            "single",
+            "a/b/c",
+            "a/",
+            "/b",
+            "@/repo",
+            "a/b@c",
+            "..",
+            "../repo",
+            ".",
+            "a/b\\c",
+            "a/b c",
+            "a/../b",
+            "github:../evil",
         ] {
             assert!(
                 parse_remote_reference(bad).is_err(),
                 "should reject {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn package_names_cannot_escape_registry() {
+        let dir = PathBuf::from("/tmp/wallr-pkgs");
+        assert!(contained_package_path(&dir, "my-theme").is_ok());
+        for bad in [
+            "",
+            "..",
+            "../evil",
+            "a/b",
+            "a\\b",
+            "/absolute",
+            ".",
+            "a/../b",
+            "evil\0name",
+        ] {
+            assert!(
+                contained_package_path(&dir, bad).is_err(),
+                "should reject {bad:?}"
+            );
+        }
+        // Lexical containment holds for valid names.
+        let joined = contained_package_path(&dir, "my-theme").unwrap();
+        assert!(joined.starts_with(&dir));
     }
 
     #[test]

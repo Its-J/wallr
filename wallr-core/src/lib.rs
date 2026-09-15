@@ -8,6 +8,9 @@
 // `spawn_blocking`). That depth comes from wgpu, not from our code, and the
 // types were accepted under the old limit — so allow the lint here until a
 // wgpu upgrade shallows those internals. See rust-lang/rust#159228.
+// `unknown_lints` is also allowed so stable (which doesn't know this lint
+// yet) doesn't error under `-D warnings`.
+#![allow(unknown_lints)]
 #![allow(recursion_depth_exceeding_limit)]
 
 pub mod animated;

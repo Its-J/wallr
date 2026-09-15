@@ -62,7 +62,17 @@ PreviewWindow (same Effect type)             ┘
 - **State Machine**: Holds persistent layer-shell surface handle and previous/current texture memory. Accepts IPC commands (`Pause`, `Resume`, `Reload`, `Preview`, `Stop`, `Status`, `Info`, `Seek`, `Blank`, `Restore`) without recreating Wayland windows. The `Preview` command carries a full serialized `animation::Effect` (name + all parameters), so every effect/position/easing combination is expressible over the wire. `Stop` removes the socket file before the process exits, so a stale socket never survives a clean shutdown. `Blank` displays black without replacing the persisted wallpaper; `Restore` validates paths and returns to the previous wallpaper.
 - **Crate Layout**: `src/animation/` also provides `effect_from_name`, `effect_names`, `origin_from_preset`, and `apply_effect_overrides`, the shared helpers the CLI uses to translate `--effect/--origin/--angle/--easing/--direction/--from/--to/...` flags into an `Effect`.
 
-### 4. Color Theme Pipeline (`theme`)
+### 4. Persistent State
+
+The daemon remembers the last wallpaper per output so it can restore it on restart and after hotplug. State is kept under the cache directory (usually `~/.cache/wallr`, or `$XDG_CACHE_HOME/wallr`):
+
+- `~/.cache/wallr/last_wallpaper/<OUTPUT>` — path of the last wallpaper successfully applied to that output (for example `DP-1`, `HDMI-A-1`). Check it with `cat ~/.cache/wallr/last_wallpaper/DP-1` or `ls ~/.cache/wallr/last_wallpaper/`.
+- `~/.cache/wallr/previous_wallpaper/<OUTPUT>` — the previous wallpaper for that output, kept so a failed restore can fall back to it.
+- `~/.cache/wallr/theme/<hash>.png` — first-frame stills extracted from video or GIF wallpapers for theme providers (Matugen, Wallust, Pywal). Cached by source path plus mtime.
+
+The daemon writes `last_wallpaper` only after a wallpaper commit succeeds. On startup it tries `last_wallpaper` and falls back to `previous_wallpaper` if that file is missing. `wallr ipc blank` does not overwrite this state, and `wallr ipc restore` reads from it.
+
+### 5. Color Theme Pipeline (`theme`)
 - **Providers**: `matugen`, `wallust`, `pywal`
 - **Execution**: Non-interactive command invocation with silent stdio redirection (`Stdio::null()`) to prevent terminal clutter while keeping theme color generation fully automated.
 - **Reload Hooks**: Executes application reload signals (`pkill -SIGUSR1 kitty`, `waybar`, etc.) after color scheme updates.

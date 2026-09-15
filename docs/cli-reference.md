@@ -33,4 +33,12 @@ wallr quit
 
 `wallr monitor list` queries the daemon for all connected outputs and prints each output's name and resolution. `wallr monitor current` returns the primary output. Output names are resolved from the compositor (e.g. `DP-1`, `HDMI-A-1`, `eDP-1`); if the compositor doesn't provide names, a fallback based on make/model or a generated ID is used.
 
+To see the last wallpaper applied to an output, read the per-output state file under `~/.cache/wallr`:
+
+```bash
+cat ~/.cache/wallr/last_wallpaper/DP-1
+ls ~/.cache/wallr/last_wallpaper/
+for f in ~/.cache/wallr/last_wallpaper/*; do echo "$f: $(cat "$f")"; done
+```
+
 Run `wallr <command> --help` for the exact flags emitted by the installed binary.

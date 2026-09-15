@@ -136,6 +136,8 @@ cargo install --path wallr --force
 
 [Changelog](CHANGELOG.md) · [CLI reference](docs/cli-reference.md) · [Config reference](docs/config-reference.md) · [Animation authoring](docs/animation-authoring.md) · [Architecture](docs/architecture.md) · [Matugen integration](docs/matugen-integration.md) · [Video wallpapers](docs/video-wallpaper.md)
 
+Last wallpaper per output is stored at `~/.cache/wallr/last_wallpaper/<OUTPUT>` — see [CLI reference](docs/cli-reference.md) and [Architecture](docs/architecture.md).
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).

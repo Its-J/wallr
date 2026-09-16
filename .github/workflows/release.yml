@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name for release (e.g. v0.4.0)'
+        description: 'Tag name for release (e.g. v0.5.0)'
         required: false
         type: string
 
@@ -47,7 +47,7 @@ jobs:
         # The recommended replacement for GitHub Actions is a filesystem cache
         # via VCPKG_BINARY_SOURCES=clear;files,<path>,readwrite + actions/cache
         # on that path. We cache the archives (per-port zip files) in the
-        # workspace — not inside /opt/vcpkg — so a fresh `git clone` of the
+        # workspace, not inside /opt/vcpkg, so a fresh `git clone` of the
         # tool doesn't wipe the cache.
         uses: actions/cache@v4
         with:
@@ -60,7 +60,7 @@ jobs:
       - name: Install vcpkg
         run: |
           if [ -d /opt/vcpkg/.git ]; then
-            echo "vcpkg already present from cache — updating"
+            echo "vcpkg already present from cache, updating"
             git -C /opt/vcpkg fetch --depth 1 origin "$VCPKG_COMMIT"
             git -C /opt/vcpkg checkout "$VCPKG_COMMIT"
           else
@@ -91,7 +91,7 @@ jobs:
           # toolchain version, and the job's `runs-on` automatically. A fixed
           # key here (as in the original) never changes, so it restores the
           # same snapshot forever and never saves a fresh one after the
-          # first run — this is the actual caching bug in the original file.
+          # first run; this is the actual caching bug in the original file.
           # rust-cache's default env-vars list ("CARGO CC CFLAGS CXX CMAKE
           # RUST") already matches PKG_CONFIG_ALL_STATIC's C-toolchain
           # neighbors but not the two FFmpeg linkage vars themselves, since
@@ -115,7 +115,7 @@ jobs:
           set -euo pipefail
           BIN=target/release/wallr
           if [ ! -x "$BIN" ]; then
-            echo "ERROR: $BIN not found or not executable — build did not produce a binary"
+            echo "ERROR: $BIN not found or not executable; build did not produce a binary"
             exit 1
           fi
           if ldd "$BIN" | grep -qE 'libav(a|util|codec|format|sw)'; then

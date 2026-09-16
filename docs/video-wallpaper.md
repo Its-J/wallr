@@ -47,7 +47,7 @@ video:
 
 Hardware acceleration needs the usual driver files: `/dev/dri/renderD128` for Mesa VAAPI and `/dev/nvidia0` for NVIDIA NVDEC. Without them, software decoding still works but uses more CPU; 1080p H.264 software decode typically costs 10-20% of one core, while hardware decode keeps the daemon near idle.
 
-FFmpeg does not need to be present at runtime for the official release binaries — they are built with a statically linked FFmpeg. Source builds link the system FFmpeg dynamically and require the development libraries (`libavcodec-dev`, `libavformat-dev`, `libavutil-dev`, `libswscale-dev`) and a system FFmpeg ABI that matches what the binary was built against.
+FFmpeg does not need to be present at runtime for the official release binaries; they are built with a statically linked FFmpeg. Source builds link the system FFmpeg dynamically and require the development libraries (`libavcodec-dev`, `libavformat-dev`, `libavutil-dev`, `libswscale-dev`) and a system FFmpeg ABI that matches what the binary was built against.
 
 ## Troubleshooting
 

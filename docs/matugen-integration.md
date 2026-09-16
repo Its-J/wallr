@@ -9,7 +9,7 @@ matugen: {enabled: true, mode: dark, wait: true, args: []}
 
 `matugen.mode` is passed to matugen's `--mode` flag, so it must be `light` or `dark` (the default is `dark`). `scheme` maps to `--type` and `contrast` to `--contrast`. Wallr runs `matugen image <wallpaper> --mode <mode> --type <scheme> --contrast <n> --source-color-index 0`, followed by any extra `args`. Matugen then runs its own template `post_hook` commands; Wallr additionally runs its `reload` list afterwards.
 
-Video and GIF wallpapers now work for theming too: when the wallpaper is a video (`mp4`/`webm`/`mkv`/`mov`/`avi`/`m4v`) or GIF, Wallr extracts the first frame to `~/.cache/wallr/theme/<hash>.png` (FFmpeg for video, `image` crate for GIF) and passes that still to the theme provider. The extracted frame is cached by source path + mtime and reused until the source changes. All providers (`matugen`, `wallust`, `pywal`) benefit — no manual extraction is needed.
+Video and GIF wallpapers now work for theming too: when the wallpaper is a video (`mp4`/`webm`/`mkv`/`mov`/`avi`/`m4v`) or GIF, Wallr extracts the first frame to `~/.cache/wallr/theme/<hash>.png` (FFmpeg for video, `image` crate for GIF) and passes that still to the theme provider. The extracted frame is cached by source path + mtime and reused until the source changes. All providers (`matugen`, `wallust`, `pywal`) benefit; no manual extraction is needed.
 
 ## Forcing matugen per invocation
 
@@ -42,4 +42,4 @@ Without `--no-theme`, Matugen → Wallr → Matugen loops indefinitely. Wallr do
 > arguments = ["img", "--no-theme"]
 > set = true
 > ```
-> Current Matugen emits `⚠ You should not define arguments inside of [config.wallpaper] anymore. Use the command instead and use the {{ image }} keyword`. Migrate to the single `command` string with `{{ image }}` as shown above — e.g. `command = "wallr img --no-theme {{ image }}"`.
+> Current Matugen emits `⚠ You should not define arguments inside of [config.wallpaper] anymore. Use the command instead and use the {{ image }} keyword`. Migrate to the single `command` string with `{{ image }}` as shown above, for example: `command = "wallr img --no-theme {{ image }}"`.

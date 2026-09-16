@@ -30,30 +30,30 @@ Every effect is a transition between the current wallpaper and the new one. All 
 
 | Effect | Type | Parameters | Defaults |
 |---|---|---|---|
-| `fade` | Transition | `from`, `to`, `easing` | `from: 0.0, to: 1.0` |
-| `blur` | Transition | `from`, `to`, `easing` | `from: 20.0, to: 0.0` |
-| `wipe` | Circular reveal | `direction`, `angle`, `softness`, `easing` | `direction: left, softness: 0.12` |
-| `slide` | Circular reveal | `direction`, `easing` | `direction: left` |
-| `zoom` | Transition | `from`, `to`, `origin`, `easing` | `from: 1.08, to: 1.0, origin: center` |
-| `pixelate` | Transition | `from`, `to`, `easing` | `from: 64.0, to: 1.0` |
-| `ripple` | Transition | `origin`, `frequency`, `amplitude`, `speed`, `easing` | `frequency: 12.0, amplitude: 0.03, speed: 5.0, origin: center` |
-| `dissolve` | Transition | `scale`, `softness`, `easing` | `scale: 4.0, softness: 0.05` |
-| `wave` | Circular wave reveal | `frequency`, `amplitude`, `angle`, `easing` | `frequency: 3.0, amplitude: 0.05` |
-| `grow` | Transition | `origin`, `easing` | `origin: center` |
-| `outer` | Transition | `origin`, `easing` | `origin: center` |
+| `fade` | Crossfade | `from`, `to`, `easing` | `from: 0.0, to: 1.0, easing: ease_in_out` |
+| `blur` | 16-sample Gaussian blur | `from`, `to`, `easing` | `from: 20.0, to: 0.0, easing: ease_in_out` |
+| `wipe` | Directional linear sweep | `direction`, `angle`, `softness`, `easing` | `direction: left, softness: 0.08, easing: ease_in_out` |
+| `slide` | Directional translation reveal | `direction`, `easing` | `direction: left, easing: ease_in_out` |
+| `zoom` | Camera push focus | `from`, `to`, `origin`, `easing` | `from: 1.08, to: 1.0, origin: center` |
+| `pixelate` | Dynamic mosaic grid | `from`, `to`, `easing` | `from: 64.0, to: 1.0` |
+| `ripple` | Liquid surface ripple | `origin`, `frequency`, `amplitude`, `speed`, `easing` | `frequency: 12.0, amplitude: 0.015, speed: 5.0, origin: center` |
+| `dissolve` | Cellular noise dissolve | `scale`, `softness`, `easing` | `scale: 4.0, softness: 0.065` |
+| `wave` | Oscillating wave reveal | `frequency`, `amplitude`, `angle`, `easing` | `frequency: 3.2, amplitude: 0.035` |
+| `grow` | Expanding circular reveal | `origin`, `easing` | `origin: center, easing: emphatic` |
+| `outer` | Collapsing circular reveal | `origin`, `easing` | `origin: center, easing: spring` |
 
 ### `easing`
 
-All effects accept an easing curve that is applied to the transition progress before any parameter is evaluated:
+All effects accept an easing curve that is applied to the transition progress:
 
 | Value | Curve |
 |---|---|
-| `linear` | Constant velocity |
+| `linear` | Constant linear progress |
 | `ease_in` | Cubic ease-in (accelerating) |
-| `ease_out` | Cubic ease-out (decelerating) |
-| `ease_in_out` | Cubic ease-in-out (default) |
-| `emphatic` | Small overshoot/settle |
-| `spring` | Damped spring |
+| `ease_out` | Cubic ease-out (smooth deceleration) |
+| `ease_in_out` | C2-continuous quintic smootherstep (zero endpoint acceleration, default) |
+| `emphatic` | Back-out overshoot with confident snap-to-target |
+| `spring` | Critically-damped harmonic settling without oscillation |
 
 ### `origin`: positioning & layout
 

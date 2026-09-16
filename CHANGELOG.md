@@ -1,6 +1,127 @@
 # Changelog
 
-## 0.4.0 — 2026-09-15
+All notable changes to Wallr are documented here.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and versions follow [Semantic Versioning](https://semver.org/).
+
+## [0.5.0] - 2026-09-16
+
+### Added
+
+- Added repeatable Wayland benchmark coverage against awww.
+- Added short CLI flags, including `-e`, `-d`, `-o`, `-a`, `-m`, `-t`, and `-c`.
+- Added the zero-duration static-image `wl_shm` fast path.
+- Added `WALLR_SOCKET` support for isolated daemon instances.
+
+### Changed
+
+
+## 0.5.0 - performance engineering
+
+- Made GPU initialization genuinely lazy: static daemon startup now avoids
+  adapter/device discovery, shader and pipeline creation, swapchain surfaces,
+  and per-output GPU uniform buffers until dynamic content is requested.
+- Shared the lazily-created renderer across outputs while retaining separate
+  per-output surfaces and uniforms for correctness.
+- Verified the local release daemon through static and GIF benchmark workloads;
+  static-only RSS dropped substantially after removing eager GPU residency.
+- Switched the long-lived daemon/CLI executor to Tokio's current-thread
+  scheduler. Blocking decode/render work already uses dedicated blocking tasks,
+  so this removes idle worker threads without reducing rendering concurrency.
+- Reduced the animated-frame cache ceiling from 256 MiB to 128 MiB. This keeps
+  normal 1080p GIF playback cached and smooth while bounding the memory impact
+  of unusually large animations.
+- Capped Tokio's blocking pool at four workers so bursty IPC benchmarks cannot
+  leave an unbounded number of sleeping workers resident.
+- Simplified the static `wl_shm` pixel swizzle to direct channel stores,
+  removing a per-pixel temporary slice from the upload hot loop.
+- Replaced the scalar Lanczos resize used for downscaled images with
+  `fast_image_resize`'s CPU-accelerated implementation while preserving the
+  same Lanczos3 quality. A measured 3840×2160 static switch stayed around
+  20–27 ms against awww's roughly 95–112 ms on the benchmark host.
+- Corrected benchmark baseline methodology by applying the same initial static
+  image to both daemons before measuring resident resources.
+
+- Prevented explicit-sync protocol failures when a layer surface has already
+  presented through wgpu: later static requests remain on that surface's GPU
+  path instead of switching it to an incompatible `wl_shm` commit.
+- Benchmark reports now stop live animated playback before sampling final idle
+  RAM and CPU, separating settled daemon cost from intentional decoder state.
+- Added `BENCHMARK_INCLUDE_ANIMATED=0` for repeatable static-only residency
+  measurements while evaluating renderer lifetime changes.
+- Cached static wallpapers now restore without an unnecessary startup
+  transition, avoiding temporary GPU work during daemon initialization.
+- Static image switches now skip the GIF scanner entirely for non-GIF files,
+  avoiding a redundant full-file read before normal image decoding.
+- Moved static `wl_shm` pixel preparation into a renderer-independent helper,
+  establishing the boundary needed for lazy GPU initialization.
+- Grouped per-output GPU resources behind a dedicated ownership boundary,
+  preparing safe optional GPU state without changing dynamic rendering behavior.
+
+- **GPU Animation Overhaul (awww/swww parity & precision)**:
+  - Replaced radial wipe fallbacks with true directional linear sweep (`linear_wipe_reveal`) supporting angled sweeps and directional vectors (`-a <DEG>`, `--direction <X,Y>`).
+  - Upgraded Gaussian blur from 8-sample radial ring to a 16-sample golden-angle circular bokeh disk, eliminating banding and aliasing.
+  - Implemented C2-continuous quintic smootherstep ($6t^5 - 15t^4 + 10t^3$) across CPU evaluation and WGSL shaders, guaranteeing zero velocity and acceleration at start/end frames.
+  - Added exact GPU mirrors of back-out overshoot (`emphatic`) and critically-damped harmonic settling (`spring`) without unwanted oscillations.
+  - Upgraded texture minification and mipmap filters from `Nearest` to `Linear` on static and video samplers to eliminate sub-pixel shimmer during zoom/scale transitions.
+  - Refined all 8 bundled animation packages (`crossfade`, `grow`, `outer`, `wave`, `liquid`, `wipe-blur`, `minimal`, `retro`) with non-overlapping, human-tuned parameters.
+- **Clean, Minimal CLI Interface**:
+  - Added ergonomic short flags: `-e` (effect), `-d` (duration), `-o` (origin), `-a` (angle), `-m` (monitor), `-t` (theme), `-c` (config).
+  - Streamlined `wallr set` / `wallr img` flags and aligned command help strings.
+  - Redesigned CLI terminal outputs (`doctor`, `validate`, `cache`, `monitor`, `search`) into clean, minimal, non-bloated tables and indicators.
+- Added a zero-duration static-image fast path backed by `wl_shm`: completed
+  static images can bypass shader rendering, release their GPU texture, and
+  remain compositor-owned until the next change. Transitions, GIFs, and video
+  retain the wgpu path.
+- Linux renderer initialization now probes only Vulkan and OpenGL, avoiding
+  unrelated wgpu backend discovery while preserving a compatibility fallback.
+- Fixed static `wl_shm` replacement when the compositor still owns the
+  previous buffer; Wallr now allocates a released-aware slot instead of
+  silently falling back to GPU textures and accumulating resident memory.
+- Static wallpaper requests are idempotent: repeating the active path, mode,
+  and effect does not decode, upload, allocate, or start another transition.
+- Superseded transitions and live players check their generation before taking
+  the render lock and during playback, releasing obsolete GPU resources early.
+- Paused and superseded GIF/video pacing now wakes immediately when a new
+  command arrives instead of waiting for the previous sleep deadline.
+- GIF playback presents at frame boundaries rather than once per display
+  refresh, and static content has no animation wakeup path.
+- Daemon surfaces use a one-frame FIFO latency target; the renderer requests a
+  power-efficient adapter and memory-use-oriented device allocation policy.
+- Video decode backpressure is bounded without a tight 1 ms polling loop.
+- Added `scripts/benchmark-wallpapers.sh` for repeatable live Wayland
+  comparisons against `awww` using hot-path and distinct-image workloads.
+- Benchmark reports now include RSS/PSS, anonymous, private, and
+  non-anonymous memory categories to diagnose renderer residency instead of
+  relying on a single RSS number.
+- Fixed startup registration of already-connected outputs so IPC commands use
+  the live render states immediately instead of waiting for a hotplug event.
+- Added the `WALLR_SOCKET` process override and isolated benchmark daemon
+  cleanup, allowing local-release comparisons beside an installed daemon.
+- Static wallpaper requests no longer block behind a GPU transition parked in
+  a compositor present; they fall back to the nonblocking replacement path so
+  IPC remains responsive during suspend, monitor disable, and compositor
+  stalls.
+- Benchmark idle samples now wait for daemon startup, output discovery, and
+  GPU initialization to settle, preventing startup CPU from being reported as
+  steady-state idle usage.
+- Removed an unused source-image copy from the daemon wallpaper hot path;
+  rendering and restore already use the original validated path, while cache
+  inspection and clearing remain available explicitly.
+- Removed the unused cache manager from daemon-owned `WallpaperEngine` state;
+  cache commands now initialize it only when explicitly requested.
+- Removed the unused package registry from daemon-owned `WallpaperEngine`
+  state; package resolution and installation remain CLI-owned.
+- Reduced initial per-output `wl_shm` pool allocation to 4 KiB; Smithay's
+  `SlotPool` grows automatically when the first real wallpaper buffer is
+  created, avoiding full-resolution shm reservation during daemon startup.
+
+The benchmark harness reports measurements; it intentionally does not claim a
+universal ranking because compositor, GPU, image dimensions, and workload all
+change the result.
+
+## 0.4.0 - 2026-09-15
 Planned Sep 12-14, implemented Sep 15
 
 - **Do less work**: static wallpapers submit once and sleep; transitions run only for their wall-clock duration; video/GIF loops pace to frame boundaries instead of the refresh rate. No render-loop wakeups when nothing changes.
@@ -44,7 +165,7 @@ Planned Sep 12-14, implemented Sep 15
 
 ## 0.3.0
 
-- **Stabilize explicit-sync and NVDEC lifecycles** — merged in PR #13 from @Luquatic.
+- **Stabilize explicit-sync and NVDEC lifecycles** - merged in PR #13 from @Luquatic.
 
 ## 0.2.9
 
@@ -61,7 +182,7 @@ Planned Sep 12-14, implemented Sep 15
 - **Fix restore command**: `wallr ipc restore` now properly tracks the last set wallpaper and validates paths before attempting restore. Errors during restore are reported instead of being silently ignored.
 - **GIF pause/resume support**: `wallr ipc pause` and `wallr ipc resume` now correctly pause and resume GIF playback in addition to video playback. GIF timeline position is preserved when paused.
 - **Fix seek command**: `wallr ipc seek` without `--monitor` now applies to all connected outputs instead of arbitrarily selecting the first output from an unordered map.
-- **Hardware acceleration fallback improvements**: 
+- **Hardware acceleration fallback improvements**:
   - New `auto` mode tries all hardware backends (NVDEC, VAAPI, VideoToolbox) in priority order before falling back to software
   - Explicit backend requests (e.g., `nvdec`, `vaapi`) now correctly try the requested backend first, then fall back to software
   - `software` mode now uses software-only decoding without attempting hardware backends first
@@ -114,6 +235,8 @@ Planned Sep 12-14, implemented Sep 15
 ## 0.2.0
 
 - Animated GIF playback with zstd-compressed frame cache.
+
+[0.5.0]: https://github.com/programmersd21/wallr/releases/tag/v0.5.0
 - Video wallpaper support (MP4, WebM, MKV) with hardware-accelerated decoding.
 - 11 transition effects with circular reveal system.
 - Background daemon with Unix IPC.

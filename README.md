@@ -24,12 +24,14 @@ Wallr renders its own background surface on `wlr-layer-shell` compositors. It do
 ## Features
 
 - Static, GIF, and video wallpapers (MP4, WebM, MKV) with hardware-accelerated decode
-- 11 transitions — fade, blur, wipe, slide, zoom, pixelate, ripple, dissolve, wave, grow, outer
+- 11 transitions: fade, blur, wipe, slide, zoom, pixelate, ripple, dissolve, wave, grow, outer
 - Per-monitor wallpapers and scaling modes
 - Background daemon over a Unix socket, with directory watching for auto-apply
 - Optional post-apply theming via Matugen, Wallust, or Pywal
 - YAML animation packages with an install/search registry
 - Near-zero idle overhead: static wallpapers render once and sleep; video and GIFs pace to frame boundaries
+- Zero-duration static sets can use a low-memory `wl_shm` compositor buffer; GPU rendering remains available for transitions and live media
+- Performance harness for live Wayland measurements against `awww` (`scripts/benchmark-wallpapers.sh`)
 
 ## Screenshots
 
@@ -38,7 +40,7 @@ Wallr renders its own background surface on `wlr-layer-shell` compositors. It do
   &nbsp;
   <img src="https://raw.githubusercontent.com/programmersd21/wallr/main/assets/rice_2.png" alt="System monitor and lazygit over a Catppuccin Mocha sunset" width="49%">
   <br>
-  <em>Catppuccin Mocha sunset — audio visualizer and fetch widget (left), system monitor and git workflow (right)</em>
+  <em>Catppuccin Mocha sunset: audio visualizer and fetch widget (left), system monitor and git workflow (right)</em>
 </p>
 
 ## Install
@@ -58,10 +60,16 @@ nix run github:programmersd21/wallr
 ## Usage
 
 ```bash
+# Basic wallpaper change
 wallr set wallpaper.jpg
-wallr set wallpaper.jpg --effect grow --origin bottom_right --duration 1.2s
-wallr set video.mp4 --effect wave --duration 1s
-wallr watch ~/Pictures
+
+# Smooth transitions with ergonomic short flags
+wallr set wallpaper.jpg -e grow -o center -d 850ms
+wallr set wallpaper.jpg -e wipe -a 45 -d 800ms
+wallr set video.mp4 -e wave -d 900ms
+
+# Automatic directory rotation
+wallr watch ~/Pictures/Wallpapers
 ```
 
 `wallr set` starts the daemon automatically if it isn't already running. Full flag reference: [`docs/cli-reference.md`](docs/cli-reference.md).
@@ -93,7 +101,7 @@ Full schema: [`docs/config-reference.md`](docs/config-reference.md).
 
 | | |
 |---|---|
-| Compositor | Hyprland, Sway, niri (layer rule required), or KDE Plasma 6 — any `wlr-layer-shell` implementation. GNOME/Mutter is unsupported. |
+| Compositor | Hyprland, Sway, niri (layer rule required), or KDE Plasma 6: any `wlr-layer-shell` implementation. GNOME/Mutter is unsupported. |
 | Rust | stable, for building from source |
 | FFmpeg | required only when building from source, for video wallpapers. Prebuilt release binaries statically link FFmpeg. |
 
@@ -122,26 +130,49 @@ The `wallr` CLI talks to `wallr daemon` over a Unix socket. The daemon owns the 
 
 Details: [`docs/architecture.md`](docs/architecture.md).
 
+### Performance measurements
+
+Wallr is optimized around event-driven static rendering and bounded live
+playback. Use the included harness to measure the daemon on your compositor:
+
+```bash
+scripts/benchmark-wallpapers.sh
+```
+
+It requires a running Wayland session, `hyperfine`, `awww`, and release-built
+Wallr. Comparisons are machine- and workload-specific; do not interpret one
+run as a universal ranking.
+
 ## Troubleshooting
 
-**`error while loading shared libraries: libavutil.so.58`** — the installed binary was built against an older FFmpeg ABI. Reinstall the latest release (statically linked), or rebuild from source:
+**`error while loading shared libraries: libavutil.so.58`**: the installed binary was built against an older FFmpeg ABI. Reinstall the latest release (statically linked), or rebuild from source:
 
 ```bash
 cargo install --path wallr --force
 ```
 
-**Wallpaper intercepts input** — it shouldn't; the surface runs on `Layer::Background` with `KeyboardInteractivity::None` and an empty input region. If it happens: confirm your compositor is supported, check compositor logs for layer-shell errors, restart the daemon (`pkill wallr && wallr daemon`), and on niri add a layer-shell rule permitting Wallr on the background layer.
+**Wallpaper intercepts input**: it shouldn't; the surface runs on `Layer::Background` with `KeyboardInteractivity::None` and an empty input region. If it happens: confirm your compositor is supported, check compositor logs for layer-shell errors, restart the daemon (`pkill wallr && wallr daemon`), and on niri add a layer-shell rule permitting Wallr on the background layer.
 
 ## Documentation
 
 [Changelog](CHANGELOG.md) · [CLI reference](docs/cli-reference.md) · [Config reference](docs/config-reference.md) · [Animation authoring](docs/animation-authoring.md) · [Architecture](docs/architecture.md) · [Matugen integration](docs/matugen-integration.md) · [Video wallpapers](docs/video-wallpaper.md)
 
-Last wallpaper per output is stored at `~/.cache/wallr/last_wallpaper/<OUTPUT>` — see [CLI reference](docs/cli-reference.md) and [Architecture](docs/architecture.md).
+Last wallpaper per output is stored at `~/.cache/wallr/last_wallpaper/<OUTPUT>`; see [CLI reference](docs/cli-reference.md) and [Architecture](docs/architecture.md).
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Credits
+
+Sample wallpapers in `samples/` are mostly taken from:
+
+- [AngelJumbo/gruvbox-wallpapers](https://github.com/AngelJumbo/gruvbox-wallpapers)
+- [vyrx-dev/Wallpapers](https://github.com/vyrx-dev/Wallpapers)
+- [`samples/extra.gif`](samples/extra.gif) from [binnewbs/arch-hyprland](https://github.com/binnewbs/arch-hyprland/blob/main/wallpapers/bbd85fa86d8dc8e3fc64d086f6641a5c.gif)
+
+All rights belong to their respective owners; thanks to the original authors for sharing their work.
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT; see [LICENSE](LICENSE).

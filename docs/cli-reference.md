@@ -1,44 +1,116 @@
-# CLI reference
+# CLI Reference
 
-The CLI is implemented with Clap. The current commands are:
+`wallr` is controlled via subcommands and ergonomic flags.
 
 ```text
-wallr img <path> [--mode <fill|fit|stretch|center|tile>] [--no-theme] [--theme <matugen|wallust|pywal|none>] [--monitor <name>] [--animation <package>] [--duration <800ms|1.2s>]
-wallr set <path> [same options as img]
-wallr new <name> [--shader]
+wallr set <path> [-e <effect>] [-d <duration>] [-o <origin>] [-a <angle>] [-m <output>] [-t <theme>] [--mode <mode>]
 wallr daemon [--max-fps <fps>]
+wallr preview <path> [-w] [--animation <package>] [effect flags]
 wallr watch <directory>
-wallr preview <path> [--watch] [--animation <package|yaml>] [--mode <fill|fit|stretch|center|tile>] [effect flags]
-wallr validate <animation.yaml>
+wallr reload
+wallr quit
 wallr doctor
+wallr validate <animation.yaml>
+wallr new <name> [--shader]
 wallr install <username/repo>
 wallr search <query>
-wallr cache clear|info
-wallr reload
-wallr config get|set|path
-wallr monitor list|current
-wallr ipc pause|resume|reload|preview|stop|status|info|seek <timestamp>|blank|restore [effect flags]
-wallr quit
+wallr cache <info|clear>
+wallr config <get|set|path>
+wallr monitor <list|current>
+wallr ipc <pause|resume|reload|status|info|stop|seek|blank|restore>
 ```
 
-`--theme <PROVIDER>` forces the theme pipeline for one invocation only (overrides `theme.provider` from the config without modifying it). `--no-theme` still disables it entirely; passing both makes `--no-theme` win. Example: `wallr set ~/Pictures/a.jpg --theme matugen` regenerates the Material You scheme from the image even if the config provider is unset or different.
+---
 
-`--mode <SCALING>` sets the image scaling mode: `fill` (cover, crops to fill), `fit` (contain, letterbox/pillarbox), `stretch` (ignores aspect ratio), `center` (1:1 centered), `tile` (repeat). Default is `fill`. The mode is applied at the shader level, so transitions and live playback both use it.
+## Wallpaper Commands
 
-`wallr daemon --max-fps <FPS>` sets a maximum rendering frame rate cap for video/GIF pacing and transitions (overriding `daemon.max_fps` in config).
-
-`wallr reload` re-reads the config from disk and applies it without restarting the daemon: the new config is validated first (an invalid file is rejected and the running config is kept), then `video.hw_decode`/`video.preload_frames`/`daemon.max_fps` are applied live to all outputs. Wallpaper pixels are shown before theme/hooks run: `wallr set` returns once the image is committed, and the theme pipeline (Matugen/Wallust/Pywal plus hooks and reload commands) continues detached, so rapid consecutive sets supersede obsolete theme work instead of queueing behind it.
-
-`wallr ipc info` reports version, GPU, decoder state, and playback position; `wallr ipc seek` accepts `HH:MM:SS`, `M:SS`, or plain seconds. `wallr ipc pause` and `wallr ipc resume` work for both video and GIF playback, preserving timeline position when paused. `wallr ipc blank` displays black without replacing the persisted wallpaper; `wallr ipc restore` returns to the previous image. Both support custom transition effect flags (`--effect`, `--duration`, etc.). All IPC commands accept `--monitor <name>` for per-output control; without `--monitor`, pause/resume/seek/blank/restore apply to all connected outputs. `wallr quit` is an alias for `wallr ipc stop` and removes the daemon socket before exiting.
-
-`wallr monitor list` queries the daemon for all connected outputs and prints each output's name and resolution. `wallr monitor current` returns the primary output. Output names are resolved from the compositor (e.g. `DP-1`, `HDMI-A-1`, `eDP-1`); if the compositor doesn't provide names, a fallback based on make/model or a generated ID is used.
-
-To see the last wallpaper applied to an output, read the per-output state file under `~/.cache/wallr`:
+### `wallr set <path>` (alias: `wallr img`)
+Sets the wallpaper for your desktop. Automatically launches the background daemon if not already running.
 
 ```bash
-cat ~/.cache/wallr/last_wallpaper/DP-1
-ls ~/.cache/wallr/last_wallpaper/
-for f in ~/.cache/wallr/last_wallpaper/*; do echo "$f: $(cat "$f")"; done
+# Basic wallpaper set (uses config default transition or 700ms quintic crossfade)
+wallr set ~/Pictures/wallpaper.png
+
+# Transition effects with short flags
+wallr set ~/Pictures/wallpaper.png -e grow -o center -d 850ms
+wallr set ~/Pictures/wallpaper.png -e wipe -a 45 -d 800ms
+wallr set ~/Pictures/wallpaper.png -e wave -d 900ms
+
+# Target specific output and scaling mode
+wallr set ~/Pictures/wallpaper.png -m DP-1 --mode fit
+
+# Force dynamic theming (Matugen, Wallust, Pywal) or disable
+wallr set ~/Pictures/wallpaper.png -t matugen
+wallr set ~/Pictures/wallpaper.png --no-theme
 ```
 
-Run `wallr <command> --help` for the exact flags emitted by the installed binary.
+#### Flags
+| Flag | Long | Description |
+|---|---|---|
+| `-e` | `--effect <NAME>` | Transition: `fade`, `wipe`, `slide`, `grow`, `outer`, `wave`, `blur`, `zoom`, `pixelate`, `ripple`, `dissolve`, `any`, `random` |
+| `-d` | `--duration <TIME>` | Wall-clock duration (`700ms`, `1s`, `1.2s`) |
+| `-o` | `--origin <PRESET\|X,Y>` | Origin: `top_left`, `top`, `top_right`, `left`, `center`, `right`, `bottom_left`, `bottom`, `bottom_right`, or normalized `x,y` |
+| `-a` | `--angle <DEG>` | Wipe/wave travel angle in degrees (`0` = right, `90` = up) |
+| `-m` | `--monitor <OUTPUT>` | Target output (e.g. `DP-1`, `HDMI-A-1`) |
+| `-t` | `--theme <PROVIDER>` | One-shot theme generator: `matugen`, `wallust`, `pywal`, `none` |
+| | `--mode <MODE>` | Scaling mode: `fill`, `fit`, `stretch`, `center`, `tile` (default: `fill`) |
+| | `--animation <PKG>` | Preset animation package name or path |
+| | `--easing <CURVE>` | Easing curve: `linear`, `ease_in`, `ease_out`, `ease_in_out`, `emphatic`, `spring` |
+| | `--softness <VAL>` | Edge softness / feather for wipe and dissolve |
+
+---
+
+## Daemon & Watcher
+
+### `wallr daemon`
+Starts the persistent Wayland layer-shell daemon.
+```bash
+wallr daemon
+wallr daemon --max-fps 120
+```
+
+### `wallr watch <directory>`
+Monitors a directory for new or modified images and rotates wallpapers automatically.
+```bash
+wallr watch ~/Pictures/Wallpapers
+```
+
+### `wallr reload`
+Re-reads configuration from disk and live-applies settings (`max_fps`, `hw_decode`, etc.) without restarting the daemon.
+
+### `wallr quit`
+Gracefully shuts down the running daemon and removes the Unix socket.
+
+---
+
+## Utilities & Maintenance
+
+### `wallr doctor`
+Runs environment checks (Wayland socket, layer-shell support, theme binary availability, and loop risks).
+
+### `wallr validate <file.yaml>`
+Lints animation package structure, duration formatting, and transpiles custom shader effects.
+
+### `wallr cache <info|clear>`
+Displays decoded frame cache statistics or purges cached frames and theme palettes.
+
+### `wallr monitor <list|current>`
+Queries connected Wayland outputs and current display dimensions.
+
+### `wallr preview <path> [-w]`
+Opens a standalone debug window rendering the wallpaper and animation without changing desktop state. Add `-w` to hot-reload on file edits.
+
+---
+
+## Animation Package Registry
+
+```bash
+# Install package from GitHub
+wallr install username/repository
+
+# Search installed packages
+wallr search liquid
+
+# Create a new local package template
+wallr new my-transition --shader
+```

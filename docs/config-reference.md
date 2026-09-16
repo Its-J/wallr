@@ -18,4 +18,4 @@ plugins: {matugen: {enabled: false}, wallust: {enabled: false}, pywal: {enabled:
 
 `wallpaper.mode` accepts: `fill` (cover, default), `fit` (contain with letterbox), `stretch`, `center` (1:1), or `tile` (repeat).
 
-`video.preload_frames` is clamped to 1..=8 live (values above 64 are rejected on reload); `daemon.max_fps` accepts 1..=240 (`null`/`0` disables the cap). `wallr reload` / `wallr ipc reload` re-reads the config from disk, validates it, and live-applies `hw_decode`/`preload_frames`/`max_fps` without rebuilding GPU state — an invalid config is rejected and the previous valid configuration is kept.
+`video.preload_frames` is clamped to 1..=8 live (values above 64 are rejected on reload); `daemon.max_fps` accepts 1..=240 (`null`/`0` disables the cap). `wallr reload` / `wallr ipc reload` re-reads the config from disk, validates it, and live-applies `hw_decode`/`preload_frames`/`max_fps` without rebuilding GPU state; an invalid config is rejected and the previous valid configuration is kept.

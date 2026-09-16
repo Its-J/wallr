@@ -68,6 +68,19 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+For performance changes, build the release binary and run the live benchmark
+from a Wayland session:
+
+```bash
+cargo build --workspace --release
+scripts/benchmark-wallpapers.sh
+```
+
+Record compositor, GPU, output resolution, Wallr commit, competitor version,
+and workload with any result. Avoid universal performance claims from a single
+machine; verify idle, repeated-request, distinct-image, and animated/video
+cases separately.
+
 Non-trivial logic needs tests: config merge order, duration parsing, timeline scheduling, easing math, effect validation, package cycle detection, custom effect transpilation, GIF frame indexing, video scheduling.
 
 Library errors use `thiserror`. `anyhow` stays at the binary boundary. No unused dependencies, stub functions, `TODO` comments, or `unwrap()` in library code.

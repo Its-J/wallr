@@ -1,25 +1,22 @@
+# Retro: dynamic pixel-matrix dissolution with balanced crossfade.
 name: retro
-duration: 700ms
+duration: 750ms
 timeline:
   - at: 0ms
-    duration: 350ms
+    duration: 375ms
     pixelate:
-      from: 1
-      to: 64
-  - at: 350ms
-    duration: 350ms
+      from: 1.0
+      to: 48.0
+      easing: ease_in
+  - at: 375ms
+    duration: 375ms
     pixelate:
-      from: 64
-      to: 1
+      from: 48.0
+      to: 1.0
+      easing: ease_out
   - at: 0ms
-    duration: 700ms
+    duration: 750ms
     fade:
-      from: 0
-      to: 1
-custom_effects:
-  scanline:
-    params:
-      strength: 0.08
-    field: |
-      line = sin(uv.y * resolution.y * 0.5) * strength
-      return mix(old, new, clamp(t + line, 0.0, 1.0))
+      from: 0.0
+      to: 1.0
+      easing: ease_in_out

@@ -1,5 +1,7 @@
+# Outer: shrinking circle inward with natural spring weight.
 name: outer
 duration: 900ms
 effects:
   - outer:
       origin: center
+      easing: spring

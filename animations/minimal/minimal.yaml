@@ -1,10 +1,8 @@
+# Minimal: pure, uncompromising, razor-sharp quintic crossfade.
 name: minimal
-duration: 800ms
-fps: 60
+duration: 550ms
 effects:
   - fade:
-      easing: ease_out
-  - blur:
-      from: 12
-      to: 0
+      from: 0.0
+      to: 1.0
       easing: ease_in_out

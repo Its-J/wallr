@@ -16,9 +16,6 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-
-## 0.5.0 - performance engineering
-
 - Made GPU initialization genuinely lazy: static daemon startup now avoids
   adapter/device discovery, shader and pipeline creation, swapchain surfaces,
   and per-output GPU uniform buffers until dynamic content is requested.

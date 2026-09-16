@@ -298,11 +298,23 @@ pub enum ConfigError {
 pub fn load_config(path: Option<&Path>) -> Result<WallrConfig, ConfigError> {
     let p = path.map(|p| p.to_path_buf()).unwrap_or_else(config_path);
     if !p.exists() {
-        return Ok(WallrConfig::default());
+        return Ok(apply_environment_overrides(WallrConfig::default()));
     }
     let content = std::fs::read_to_string(p)?;
     let config: WallrConfig = serde_yaml::from_str(&content)?;
-    Ok(config)
+    Ok(apply_environment_overrides(config))
+}
+
+/// Applies process-scoped overrides used by launchers and isolated benchmarks.
+/// Keeping this outside YAML lets a test daemon use a private IPC socket
+/// without modifying the user's persistent configuration.
+fn apply_environment_overrides(mut config: WallrConfig) -> WallrConfig {
+    if let Ok(socket) = std::env::var("WALLR_SOCKET")
+        && !socket.is_empty()
+    {
+        config.daemon.socket = socket;
+    }
+    config
 }
 
 pub fn expand_path(path: &str) -> PathBuf {

@@ -3,62 +3,59 @@ use crate::config::{ScalingMode, ThemeProvider};
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
-/// Transition + customization flags shared by `img` / `set` / `preview`.
+/// Transition options for wallpaper changes.
 #[derive(Args, Debug, Clone, Default)]
 pub struct EffectArgs {
-    /// Transition effect: simple, fade, blur, wipe, slide, left, right, top,
-    /// bottom, zoom, pixelate, ripple, dissolve, wave, grow, center, outer,
-    /// any, random
-    #[arg(long, value_name = "NAME", value_parser = parse_effect_name)]
+    /// Transition effect: simple, fade, blur, wipe, slide, left, right, top, bottom, zoom, pixelate, ripple, dissolve, wave, grow, center, outer, any, random
+    #[arg(short = 'e', long, value_name = "NAME", value_parser = parse_effect_name)]
     pub effect: Option<String>,
 
-    /// Transition duration, for example 800ms, 1s, or 1.2s
-    #[arg(long, value_name = "DURATION")]
+    /// Transition duration (e.g. 700ms, 1s, 1.2s)
+    #[arg(short = 'd', long, value_name = "TIME")]
     pub duration: Option<String>,
 
-    /// Effect origin: a preset (top_left, top, top_right, left, center, right,
-    /// bottom_left, bottom, bottom_right) or a normalized "x,y" (0..1)
-    #[arg(long, value_name = "PRESET|X,Y")]
+    /// Effect origin: preset (top_left, top, top_right, left, center, right, bottom_left, bottom, bottom_right) or "x,y" (0..1)
+    #[arg(short = 'o', long, value_name = "PRESET|X,Y")]
     pub origin: Option<String>,
 
-    /// Wipe/wave travel angle in degrees (0 = right, 90 = up)
-    #[arg(long, value_name = "DEG")]
+    /// Angle for wipe/wave in degrees (0 = right, 90 = up)
+    #[arg(short = 'a', long, value_name = "DEG")]
     pub angle: Option<f32>,
 
-    /// Wipe/slide direction vector "x,y" (e.g. "1,0" for left-to-right)
+    /// Direction vector "x,y" (e.g. "1,0" or "-1,0")
     #[arg(long, value_name = "X,Y")]
     pub direction: Option<String>,
 
-    /// Easing curve: linear, ease_in, ease_out, ease_in_out
+    /// Easing curve: linear, ease_in, ease_out, ease_in_out, emphatic, spring
     #[arg(long, value_enum)]
     pub easing: Option<crate::animation::Easing>,
 
-    /// Start value (fade opacity, blur radius, zoom scale, pixelate size)
-    #[arg(long, value_name = "VALUE")]
+    /// Initial parameter value (fade opacity, blur radius, zoom scale, mosaic size)
+    #[arg(long, value_name = "VAL")]
     pub from: Option<f32>,
 
-    /// End value (fade opacity, blur radius, zoom scale, pixelate size)
-    #[arg(long, value_name = "VALUE")]
+    /// Target parameter value (fade opacity, blur radius, zoom scale, mosaic size)
+    #[arg(long, value_name = "VAL")]
     pub to: Option<f32>,
 
-    /// Wave/ripple frequency
+    /// Wave or ripple frequency in Hz
     #[arg(long, value_name = "HZ")]
     pub frequency: Option<f32>,
 
-    /// Wave/ripple amplitude
-    #[arg(long, value_name = "VALUE")]
+    /// Wave or ripple amplitude
+    #[arg(long, value_name = "VAL")]
     pub amplitude: Option<f32>,
 
-    /// Ripple expansion speed
-    #[arg(long, value_name = "VALUE")]
+    /// Liquid ripple expansion speed
+    #[arg(long, value_name = "VAL")]
     pub speed: Option<f32>,
 
-    /// Wipe feather / dissolve edge softness
-    #[arg(long, value_name = "VALUE")]
+    /// Wipe feather or dissolve boundary softness (0.01 - 0.5)
+    #[arg(long, value_name = "VAL")]
     pub softness: Option<f32>,
 
-    /// Dissolve noise scale
-    #[arg(long, value_name = "VALUE")]
+    /// Dissolve noise frequency scale
+    #[arg(long, value_name = "VAL")]
     pub scale: Option<f32>,
 }
 
@@ -104,7 +101,7 @@ fn parse_effect_name(s: &str) -> Result<String, String> {
         Ok(s.to_string())
     } else {
         Err(format!(
-            "unknown effect '{}' — expected one of: {}",
+            "unknown effect '{}' - expected one of: {}",
             s,
             crate::animation::effect_names().join(", ")
         ))
@@ -119,7 +116,7 @@ fn parse_origin(s: &str) -> Option<(f32, f32)> {
     Some((x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)))
 }
 
-/// Parse "x,y" into a direction vector (not normalized here — shader normalizes).
+/// Parse "x,y" into a direction vector.
 fn parse_vec2(s: &str) -> Option<[f32; 2]> {
     let mut parts = s.split(',');
     let x = parts.next()?.trim().parse::<f32>().ok()?;
@@ -130,7 +127,7 @@ fn parse_vec2(s: &str) -> Option<[f32; 2]> {
 #[derive(Parser, Debug)]
 #[command(
     name = "wallr",
-    about = "Wayland wallpaper engine with animation and theme pipelines",
+    about = "Wayland wallpaper engine with GPU animations and theme pipelines",
     version
 )]
 pub struct WallrCli {
@@ -138,218 +135,236 @@ pub struct WallrCli {
     pub command: Commands,
 
     /// Custom config file path
-    #[arg(global = true, long)]
+    #[arg(global = true, short = 'c', long)]
     pub config: Option<PathBuf>,
 
-    /// Increase log verbosity
+    /// Verbose logging (-v, -vv)
     #[arg(global = true, short = 'v', long, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
-    /// Suppress non-error output
+    /// Quiet mode (suppress non-error output)
     #[arg(global = true, short = 'q', long)]
     pub quiet: bool,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Set wallpaper with animation + theme pipeline
-    Img {
-        /// Path to the wallpaper image
-        path: PathBuf,
-        /// Disable theme generation
-        #[arg(long)]
-        no_theme: bool,
-        /// Theme provider override for this call (matugen, wallust, pywal)
-        #[arg(long, value_enum)]
-        theme: Option<ThemeProvider>,
-        /// Target monitor
-        #[arg(long)]
-        monitor: Option<String>,
-        /// Animation package to use
-        #[arg(long)]
-        animation: Option<String>,
-        /// Scaling mode
-        #[arg(long, value_enum)]
-        mode: Option<ScalingMode>,
-        /// Transition effect + customization flags
-        #[command(flatten)]
-        effect_args: EffectArgs,
-    },
-    /// Alias/superset of img
+    /// Set wallpaper image or video
+    #[command(alias = "img")]
     Set {
-        /// Path to the wallpaper image
+        /// Wallpaper file path (image, GIF, or video)
         path: PathBuf,
-        /// Disable theme generation
-        #[arg(long)]
-        no_theme: bool,
-        /// Theme provider override for this call (matugen, wallust, pywal)
-        #[arg(long, value_enum)]
-        theme: Option<ThemeProvider>,
-        /// Target monitor
-        #[arg(long)]
-        monitor: Option<String>,
-        /// Animation package to use
-        #[arg(long)]
+
+        /// Animation package name or path
+        #[arg(long, value_name = "PKG")]
         animation: Option<String>,
-        /// Scaling mode
+
+        /// Target output/monitor
+        #[arg(short = 'm', long, value_name = "OUTPUT")]
+        monitor: Option<String>,
+
+        /// Scaling mode: fill, fit, stretch, center, tile
         #[arg(long, value_enum)]
         mode: Option<ScalingMode>,
-        /// Transition effect + customization flags
+
+        /// Disable theme extraction
+        #[arg(long)]
+        no_theme: bool,
+
+        /// Override theme engine (matugen, wallust, pywal)
+        #[arg(short = 't', long, value_enum)]
+        theme: Option<ThemeProvider>,
+
+        /// Transition overrides
         #[command(flatten)]
         effect_args: EffectArgs,
     },
-    /// Environment diagnostics
+
+    /// Alias for `set`
+    #[command(hide = true)]
+    Img {
+        path: PathBuf,
+        #[arg(long)]
+        animation: Option<String>,
+        #[arg(short = 'm', long)]
+        monitor: Option<String>,
+        #[arg(long, value_enum)]
+        mode: Option<ScalingMode>,
+        #[arg(long)]
+        no_theme: bool,
+        #[arg(short = 't', long, value_enum)]
+        theme: Option<ThemeProvider>,
+        #[command(flatten)]
+        effect_args: EffectArgs,
+    },
+
+    /// Run system and dependency diagnostics
     Doctor,
-    /// Lint animation YAML
+
+    /// Validate animation package YAML
     Validate {
-        /// Path to animation YAML file
+        /// Path to animation YAML
         path: PathBuf,
     },
-    /// Configuration management
+
+    /// View and edit configuration
     Config {
         #[command(subcommand)]
         subcommand: ConfigCommands,
     },
-    /// Cache management
+
+    /// Inspect and clear decoded frame cache
     Cache {
         #[command(subcommand)]
         subcommand: CacheCommands,
     },
-    /// Re-run reload list without changing wallpaper
+
+    /// Reload config and restart theme hooks
     Reload,
-    /// Monitor management
+
+    /// Query connected outputs
     Monitor {
         #[command(subcommand)]
         subcommand: MonitorCommands,
     },
 
-    // Core Daemon & Package commands
-    /// Start the background wallpaper daemon
+    /// Run background daemon
     Daemon {
-        /// Override the target frame rate limit (FPS)
+        /// Max render FPS limit
         #[arg(long)]
         max_fps: Option<u32>,
     },
-    /// Create a working animation package starter.
+
+    /// Scaffold a new animation package
     New {
-        /// Package name or output directory.
+        /// Package name or directory
         name: String,
-        /// Include a raw WGSL shader starter.
+
+        /// Generate starter WGSL shader
         #[arg(long)]
         shader: bool,
     },
-    /// Watch a directory for new images and automatically set them
+
+    /// Watch a directory and rotate wallpapers automatically
     Watch {
-        /// Directory to watch
+        /// Directory containing wallpapers
         dir: PathBuf,
     },
-    /// Preview an animation or wallpaper image
+
+    /// Preview wallpaper and animation in an interactive window
     Preview {
-        /// Path to preview
+        /// Image path
         path: PathBuf,
-        /// Watch for changes
-        #[arg(long)]
+
+        /// Auto-reload on file changes
+        #[arg(short = 'w', long)]
         watch: bool,
-        /// Animation package or YAML file to preview
-        #[arg(long, value_name = "PACKAGE|FILE")]
+
+        /// Animation package or file
+        #[arg(long, value_name = "PKG")]
         animation: Option<String>,
-        /// Transition effect + customization flags
+
+        /// Transition options
         #[command(flatten)]
         effect_args: EffectArgs,
     },
-    /// Install an animation package from a GitHub repository (`username/repo`)
+
+    /// Install animation package from GitHub (`user/repo`)
     Install {
-        /// Remote package reference, e.g. `username/repo`
+        /// Remote package repository (`user/repo`)
         package: String,
     },
-    /// Search for installed packages in the local registry
+
+    /// Search installed animation packages
     Search {
-        /// Query to search for
+        /// Search term
         query: String,
     },
-    /// Control the running daemon via IPC commands
+
+    /// Daemon IPC controls (playback, blanking, info)
     Ipc {
         #[command(subcommand)]
         subcommand: IpcCommands,
     },
-    /// Gracefully stop the running daemon (alias for `ipc stop`)
+
+    /// Stop running daemon
     Quit,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum ConfigCommands {
-    /// Get a configuration value
+    /// Get config value by key
     Get { key: String },
-    /// Set a configuration value
+    /// Set config value by key
     Set { key: String, value: String },
-    /// Print the config path
+    /// Print path to active config file
     Path,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum CacheCommands {
-    /// Clear the cache
+    /// Delete cached frames and palettes
     Clear,
-    /// Show cache info
+    /// Display cache usage statistics
     Info,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum MonitorCommands {
-    /// List monitors
+    /// List all connected display outputs
     List,
-    /// Show current monitor
+    /// Display current focused output
     Current,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum IpcCommands {
-    /// Pause animations
+    /// Pause video/GIF playback
     Pause {
         /// Target specific monitor (default: all)
-        #[arg(long)]
+        #[arg(short = 'm', long)]
         monitor: Option<String>,
     },
-    /// Resume animations
+    /// Resume video/GIF playback
     Resume {
         /// Target specific monitor (default: all)
-        #[arg(long)]
+        #[arg(short = 'm', long)]
         monitor: Option<String>,
     },
-    /// Reload wallpaper
+    /// Re-render current wallpaper
     Reload,
-    /// Preview animation
+    /// Trigger preview transition
     Preview,
-    /// Stop daemon
+    /// Shut down the daemon
     Stop,
-    /// Get daemon status
+    /// Query daemon status
     Status,
-    /// Get video decoder and GPU information
+    /// Query GPU, video decoder, and display info
     Info {
-        /// Target specific monitor (default: all outputs)
-        #[arg(long)]
+        /// Target specific monitor
+        #[arg(short = 'm', long)]
         monitor: Option<String>,
     },
-    /// Seek video to timestamp (format: HH:MM:SS or seconds)
+    /// Seek video to position (HH:MM:SS or seconds)
     Seek {
-        /// Timestamp in format HH:MM:SS or seconds
+        /// Position in HH:MM:SS or seconds
         timestamp: String,
-        /// Target specific monitor (default: first output)
-        #[arg(long)]
+        /// Target specific monitor
+        #[arg(short = 'm', long)]
         monitor: Option<String>,
     },
-    /// Blank an output without replacing persisted wallpaper
+    /// Blank output to black with transition
     Blank {
         /// Target specific monitor (default: all)
-        #[arg(long)]
+        #[arg(short = 'm', long)]
         monitor: Option<String>,
         #[command(flatten)]
         effect_args: EffectArgs,
     },
-    /// Restore a previously blanked output
+    /// Restore wallpaper on blanked output
     Restore {
         /// Target specific monitor (default: all)
-        #[arg(long)]
+        #[arg(short = 'm', long)]
         monitor: Option<String>,
         #[command(flatten)]
         effect_args: EffectArgs,

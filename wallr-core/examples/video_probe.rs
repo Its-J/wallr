@@ -3,7 +3,7 @@
 //! Usage: `cargo run --release --example video_probe -- <video> [vaapi|nvdec|software]`
 //!
 //! Decodes the file for a few seconds and reports frame rate, timing, and the
-//! backend actually used — no Wayland or GPU required.
+//! backend actually used - no Wayland or GPU required.
 
 use std::time::{Duration, Instant};
 use wallr_core::video::{HwAccel, VideoDecoder};

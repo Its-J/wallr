@@ -1,6 +1,4 @@
-use crate::cache::CacheManager;
 use crate::config::{ThemeProvider, WallrConfig};
-use crate::packages::PackageRegistry;
 use crate::theme;
 use anyhow::Result;
 use std::path::Path;
@@ -49,8 +47,6 @@ pub struct ValidationReport {
 pub enum WallpaperError {
     #[error("Theme error: {0}")]
     Theme(#[from] crate::theme::ThemeError),
-    #[error("Cache error: {0}")]
-    Cache(#[from] crate::cache::CacheError),
     #[error("Package error: {0}")]
     Package(#[from] crate::packages::PackageError),
     #[error("Custom error: {0}")]
@@ -59,19 +55,11 @@ pub enum WallpaperError {
 
 pub struct WallpaperEngine {
     pub config: WallrConfig,
-    pub cache: CacheManager,
-    pub registry: PackageRegistry,
 }
 
 impl WallpaperEngine {
     pub fn new(config: WallrConfig) -> Result<Self, WallpaperError> {
-        let cache = CacheManager::new(&config.cache)?;
-        let registry = PackageRegistry::new()?;
-        Ok(Self {
-            config,
-            cache,
-            registry,
-        })
+        Ok(Self { config })
     }
 
     pub fn doctor(&self) -> DiagnosticReport {
@@ -222,7 +210,6 @@ impl WallpaperEngine {
                 path.display()
             )));
         }
-        let _ = self.cache.cache_image(path);
         info!(
             "Applying wallpaper natively via Wayland layer-shell surface: {:?}",
             path

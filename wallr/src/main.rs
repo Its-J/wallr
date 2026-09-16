@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use anyhow::Result;
 use clap::Parser;
 use colored::Colorize;
@@ -75,8 +77,18 @@ fn pick_effect(
     Ok((effect, duration_ms))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+// All decoding, rendering, and filesystem work is dispatched through
+// `spawn_blocking`; a current-thread scheduler avoids keeping one idle async
+// worker per CPU in the long-lived daemon and keeps the IPC-only CLI light.
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(4)
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let cli = WallrCli::parse();
 
     let filter = if cli.verbose > 0 {
@@ -172,14 +184,19 @@ async fn main() -> Result<()> {
             let engine = WallpaperEngine::new(config)?;
             let report = engine.doctor();
             println!("\n{}", "wallr doctor".bold());
-            println!("{}", "═".repeat(40));
+            println!("{}", "─".repeat(32).dimmed());
             for check in &report.checks {
                 let icon = match check.status {
                     DiagnosticStatus::Pass => "✓".green(),
-                    DiagnosticStatus::Warn => "⚠".yellow(),
+                    DiagnosticStatus::Warn => "!".yellow(),
                     DiagnosticStatus::Fail => "✗".red(),
                 };
-                println!("  {} {}: {}", icon, check.name, check.message);
+                println!(
+                    "  {} {:<22} {}",
+                    icon,
+                    check.name.bold(),
+                    check.message.dimmed()
+                );
             }
             println!();
         }
@@ -188,7 +205,7 @@ async fn main() -> Result<()> {
             let engine = WallpaperEngine::new(config)?;
             let report = engine.validate_animation(&path)?;
             println!("\n{}", format!("wallr validate {}", path.display()).bold());
-            println!("{}", "═".repeat(40));
+            println!("{}", "─".repeat(32).dimmed());
             let mut all_passed = true;
             for check in &report.checks {
                 let icon = if check.passed {
@@ -200,12 +217,12 @@ async fn main() -> Result<()> {
                     all_passed = false;
                 }
                 let msg = check.message.as_deref().unwrap_or("");
-                println!("  {} {} {}", icon, check.name, msg);
+                println!("  {} {:<28} {}", icon, check.name.bold(), msg.dimmed());
             }
+            println!();
             if !all_passed {
                 std::process::exit(1);
             }
-            println!();
         }
 
         Commands::Config { subcommand } => match subcommand {
@@ -216,7 +233,7 @@ async fn main() -> Result<()> {
                 let yaml = serde_yaml::to_string(&config)?;
                 let value: serde_yaml::Value = serde_yaml::from_str(&yaml)?;
                 match config_value(&value, &key) {
-                    Some(found) => println!("{}", serde_yaml::to_string(found)?),
+                    Some(found) => println!("{}", serde_yaml::to_string(found)?.trim_end()),
                     None => anyhow::bail!("unknown config key: {key}"),
                 }
             }
@@ -234,7 +251,7 @@ async fn main() -> Result<()> {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::write(&path, serde_yaml::to_string(&yaml)?)?;
-                println!("Updated {}", path.display());
+                println!("{} {}", "Updated".green(), path.display());
             }
         },
 
@@ -244,18 +261,19 @@ async fn main() -> Result<()> {
             match subcommand {
                 CacheCommands::Info => {
                     let info = cache.info()?;
-                    println!("\n{}", "Cache Info".bold());
-                    println!("  Directory: {}", info.cache_dir.display());
+                    println!("{}", "Cache Statistics".bold());
+                    println!("  Path:  {}", info.cache_dir.display());
                     println!("  Files: {}", info.total_files);
                     println!(
-                        "  Size: {}",
+                        "  Size:  {}",
                         humansize::format_size(info.total_size, humansize::BINARY)
                     );
                 }
                 CacheCommands::Clear => {
                     let info = cache.clear()?;
                     println!(
-                        "✓ Cleared {} files ({})",
+                        "{} Cleared {} files ({})",
+                        "✓".green(),
                         info.total_files,
                         humansize::format_size(info.total_size, humansize::BINARY)
                     );
@@ -266,10 +284,14 @@ async fn main() -> Result<()> {
         Commands::Reload => {
             let socket_path = config::expand_path(&config.daemon.socket);
             if socket_path.exists() && tokio::net::UnixStream::connect(&socket_path).await.is_ok() {
-                let _ = send_ipc_command(socket_path, IpcCommand::Reload).await;
+                let resp = send_ipc_command(socket_path, IpcCommand::Reload).await?;
+                if let Some(msg) = resp.message {
+                    println!("{}", msg);
+                }
             } else {
                 let engine = WallpaperEngine::new(config)?;
                 engine.reload()?;
+                println!("{} Reloaded configuration & hooks", "✓".green());
             }
         }
 
@@ -280,13 +302,13 @@ async fn main() -> Result<()> {
                 MonitorCommands::List => {
                     let resp = send_ipc_command(socket_path, IpcCommand::MonitorList).await?;
                     if let Some(msg) = resp.message {
-                        println!("{}", msg);
+                        println!("{}", msg.trim_end());
                     }
                 }
                 MonitorCommands::Current => {
                     let resp = send_ipc_command(socket_path, IpcCommand::MonitorCurrent).await?;
                     if let Some(msg) = resp.message {
-                        println!("{}", msg);
+                        println!("{}", msg.trim_end());
                     }
                 }
             }
@@ -300,7 +322,7 @@ async fn main() -> Result<()> {
                     println!("{}", msg);
                 }
             } else {
-                anyhow::bail!("daemon not running");
+                anyhow::bail!("daemon is not running");
             }
         }
 
@@ -356,27 +378,23 @@ async fn main() -> Result<()> {
                 IpcCommands::Status => IpcCommand::Status,
                 IpcCommands::Info { monitor } => IpcCommand::Info { monitor },
                 IpcCommands::Seek { timestamp, monitor } => {
-                    // Parse timestamp: HH:MM:SS or seconds
                     let ms = if timestamp.contains(':') {
                         let parts: Vec<&str> = timestamp.split(':').collect();
                         match parts.len() {
                             2 => {
-                                // MM:SS
                                 let min: u64 = parts[0].parse()?;
                                 let sec: u64 = parts[1].parse()?;
                                 (min * 60 + sec) * 1000
                             }
                             3 => {
-                                // HH:MM:SS
                                 let hr: u64 = parts[0].parse()?;
                                 let min: u64 = parts[1].parse()?;
                                 let sec: u64 = parts[2].parse()?;
                                 (hr * 3600 + min * 60 + sec) * 1000
                             }
-                            _ => anyhow::bail!("Invalid timestamp format. Use HH:MM:SS or seconds"),
+                            _ => anyhow::bail!("invalid timestamp format. Use HH:MM:SS or seconds"),
                         }
                     } else {
-                        // Plain seconds
                         let sec: f64 = timestamp.parse()?;
                         (sec * 1000.0) as u64
                     };
@@ -434,24 +452,21 @@ async fn main() -> Result<()> {
             use wallr_core::packages::PackageRegistry;
             let registry = PackageRegistry::new()?;
             let spec = registry.install_package(&package)?;
-            println!("Installed package: {}", spec.name);
+            println!("{} {}", "Installed".green(), spec.name.bold());
         }
 
         Commands::New { name, shader } => {
             let dir = std::path::PathBuf::from(&name);
             std::fs::create_dir_all(&dir)?;
             let yaml = format!(
-                "# Wallr animation package. Edit duration, easing, and effects.\nname: {}\nduration: 800ms\nfps: 60\n\neffects:\n  - fade:\n      easing: ease_out\n  - blur:\n      from: 20\n      to: 0\n",
+                "# Wallr animation package\nname: {}\nduration: 700ms\n\neffects:\n  - fade:\n      easing: ease_in_out\n",
                 name
             );
             std::fs::write(dir.join("wallr.yaml"), yaml)?;
             if shader {
-                std::fs::write(
-                    dir.join("starter.wgsl"),
-                    "// Add a fragment shader effect here.\n",
-                )?;
+                std::fs::write(dir.join("starter.wgsl"), "// Custom WGSL shader\n")?;
             }
-            println!("Created animation package at {}", dir.display());
+            println!("{} {}", "Created".green(), dir.display());
         }
 
         Commands::Search { query } => {
@@ -459,7 +474,13 @@ async fn main() -> Result<()> {
             let registry = PackageRegistry::new()?;
             let pkgs = registry.list_packages()?;
             let matches: Vec<_> = pkgs.into_iter().filter(|p| p.contains(&query)).collect();
-            println!("Packages matching '{}': {:?}", query, matches);
+            if matches.is_empty() {
+                println!("No packages found matching '{}'", query);
+            } else {
+                for pkg in matches {
+                    println!("  {}", pkg);
+                }
+            }
         }
     }
 

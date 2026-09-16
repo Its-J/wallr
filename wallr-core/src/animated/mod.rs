@@ -2,8 +2,8 @@
 //!
 //! The daemon parses the GIF header blocks once to learn frame delays and
 //! total duration (no pixel decode), then decodes frames on demand with the
-//! fast `gif` crate. Decoded frames are stored in memory — raw when they fit
-//! the budget, zstd-compressed otherwise — so looping playback skips the
+//! fast `gif` crate. Decoded frames are stored in memory, raw when they fit
+//! the budget and zstd-compressed otherwise, so looping playback skips the
 //! re-decode entirely: each loop is a memcpy (raw) or a decompress (zstd).
 
 use std::path::{Path, PathBuf};
@@ -13,7 +13,10 @@ use gif::DisposalMethod;
 
 /// Maximum bytes of decoded frame data kept in RAM. Frames beyond this are
 /// still decoded on demand, but not cached across loop wraps.
-const CACHE_BUDGET: usize = 256 * 1024 * 1024;
+// Keep animated wallpapers bounded without forcing normal 1080p animations to
+// re-decode every loop. At 128 MiB this fits roughly 15 full 1080p RGBA
+// frames, while preventing a single large GIF from dominating daemon RSS.
+const CACHE_BUDGET: usize = 128 * 1024 * 1024;
 const MAX_GIF_WORKING_SET: usize = 512 * 1024 * 1024;
 
 /// A cached frame: raw RGBA8 or zstd-compressed RGBA8. The whole animation
@@ -102,6 +105,16 @@ impl AnimatedImage {
     /// pixels. Returns `Ok(None)` when the file is not a GIF so callers can
     /// keep their existing static-image path.
     pub fn decode(path: &Path) -> anyhow::Result<Option<Self>> {
+        // The animation pipeline is currently GIF-specific. Avoid reading
+        // every PNG/JPEG/WebP into a temporary buffer before the normal image
+        // loader reads it again; static wallpaper switches are the hot path.
+        let is_gif = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gif"));
+        if !is_gif {
+            return Ok(None);
+        }
         let bytes = std::fs::read(path)?;
         let Some(info) = scan_gif(&bytes)? else {
             return Ok(None);

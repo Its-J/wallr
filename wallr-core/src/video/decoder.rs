@@ -517,7 +517,11 @@ impl VideoDecoder {
                         if !paused && !frame_tx.is_full() {
                             break;
                         }
-                        thread::sleep(Duration::from_millis(1));
+                        // The queue is intentionally bounded. Avoid a 1 ms
+                        // busy-poll when the consumer/GPU is behind or when
+                        // playback is paused; 2 ms still keeps seek/pause
+                        // control responsive while cutting wakeups in half.
+                        thread::sleep(Duration::from_millis(2));
                     }
                     if interrupted {
                         break;

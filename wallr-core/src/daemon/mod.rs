@@ -23,6 +23,7 @@ use smithay_client_toolkit::{
         Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
         LayerSurfaceConfigure,
     },
+    shm::slot::{Buffer as ShmBuffer, SlotPool},
     shm::{Shm, ShmHandler},
 };
 use wayland_client::{
@@ -121,7 +122,7 @@ unsafe impl Send for SendDisplayPtr {}
 /// output callbacks can create/destroy render states without needing access
 /// to the full `Daemon` state.
 struct DaemonHotplug {
-    renderer: std::sync::Arc<Renderer>,
+    renderer: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<Renderer>>>>,
     config: crate::config::WallrConfig,
     display_ptr: SendDisplayPtr,
     /// Shared render-state map. Protected by `tokio::sync::Mutex` so the IPC
@@ -635,27 +636,34 @@ impl OutputHandler for WaylandState {
                 let name = info.name.clone();
                 if let Some(ref hotplug) = self.hotplug {
                     let render_states = hotplug.render_states.clone();
-                    let renderer = hotplug.renderer.clone();
                     tokio::spawn(async move {
                         let states = render_states.lock().await;
                         if let Some(rs) = states.get(&name) {
                             let mut lock = rs.lock().await;
                             lock.width = new_width;
                             lock.height = new_height;
-                            let surf_config = wgpu::SurfaceConfiguration {
-                                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                                format: lock.format,
-                                width: new_width,
-                                height: new_height,
-                                present_mode: wgpu::PresentMode::Fifo,
-                                alpha_mode: wgpu::CompositeAlphaMode::Opaque,
-                                view_formats: vec![],
-                                desired_maximum_frame_latency: 2,
-                            };
-                            lock.surface.configure(&renderer.device, &surf_config);
-                            tracing::info!(
-                                "Hotplug: reconfigured {name} to {new_width}x{new_height}"
-                            );
+                            if let Some(gpu) = lock.gpu.as_ref() {
+                                if let Ok(shared) = lock.renderer.lock() {
+                                    if let Some(renderer) = shared.as_ref() {
+                                        gpu.surface.configure(
+                                            &renderer.device,
+                                            &wgpu::SurfaceConfiguration {
+                                                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                                                format: gpu.format,
+                                                width: new_width,
+                                                height: new_height,
+                                                present_mode: wgpu::PresentMode::Fifo,
+                                                alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+                                                view_formats: vec![],
+                                                desired_maximum_frame_latency: 1,
+                                            },
+                                        );
+                                    }
+                                }
+                                tracing::info!(
+                                    "Hotplug: reconfigured {name} to {new_width}x{new_height}"
+                                );
+                            }
                         }
                     });
                 }
@@ -759,15 +767,25 @@ impl LivePacer {
         if deadline <= now {
             return;
         }
-        let _ = self
-            .cond
-            .wait_timeout_while(guard, deadline - now, |_| true);
+        // A notification is a real scheduling event: it means a newer
+        // wallpaper may have superseded the current player.  Using
+        // `wait_timeout_while` with an always-true predicate turns every
+        // notify into a spurious wakeup and makes the waiter sleep until its
+        // full deadline anyway (up to 24h for paused GIFs).  A plain timed
+        // wait returns on notify; the caller then checks the generation and
+        // exits without another decode/upload/present.
+        let _ = self.cond.wait_timeout(guard, deadline - now);
     }
 }
 
 struct RenderState {
-    renderer: std::sync::Arc<Renderer>,
-    surface: &'static wgpu::Surface<'static>,
+    /// GPU resources are grouped behind one ownership boundary so the next
+    /// lazy-GPU step can replace this with an optional, on-demand state
+    /// without changing static Wayland/shm fields.
+    gpu: Option<GpuState>,
+    renderer: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<Renderer>>>>,
+    display_ptr: SendDisplayPtr,
+    raw_surface: SendDisplayPtr,
     /// Serializes transition rendering. The lock is only ever held by the
     /// detached render task, never by the IPC loop, so a stalled present
     /// cannot freeze the daemon.
@@ -784,7 +802,6 @@ struct RenderState {
     height: u32,
     current_width: u32,
     current_height: u32,
-    format: wgpu::TextureFormat,
     /// Video playback manager
     video_playback: std::sync::Arc<crate::video::VideoPlayback>,
     /// Hardware backend to request for new decoders (from `video.hw_decode`).
@@ -795,8 +812,9 @@ struct RenderState {
     max_fps: Option<u32>,
     /// Current scaling mode for live playback.
     scaling_mode: u32,
+    /// Effect used by the active request, for idempotent switch detection.
+    current_effect: Option<crate::animation::Effect>,
     /// Per-output uniform buffer + bind group (Issue #9 race fix).
-    per_output_uniforms: std::sync::Arc<crate::renderer::PerOutputUniforms>,
     /// Path of the last wallpaper set on this output (for restore).
     last_wallpaper: Option<std::path::PathBuf>,
     /// Previous wallpaper state before blank (for restore).
@@ -805,6 +823,26 @@ struct RenderState {
     blanked: bool,
     /// GIF playback paused state (shared with play_live task).
     gif_paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared-memory fast path for completed static wallpapers. Dynamic
+    /// content and transitions continue to use wgpu; static content can drop
+    /// its GPU image and become compositor-owned with no render loop.
+    shm_surface: wl_surface::WlSurface,
+    shm_pool: SlotPool,
+    shm_buffer: Option<ShmBuffer>,
+    shm_width: u32,
+    shm_height: u32,
+    /// A layer surface must not switch from wgpu explicit-sync commits to
+    /// bufferless `wl_shm` commits. Some compositors reject that sequence
+    /// with a missing acquire timeline. Keep static requests on wgpu after
+    /// the first GPU presentation for this surface.
+    gpu_surface_used: bool,
+}
+
+struct GpuState {
+    renderer: std::sync::Arc<Renderer>,
+    surface: &'static wgpu::Surface<'static>,
+    format: wgpu::TextureFormat,
+    per_output_uniforms: std::sync::Arc<crate::renderer::PerOutputUniforms>,
 }
 
 /// Everything the transition render task needs; the daemon state has already
@@ -836,6 +874,69 @@ struct CommitData {
 }
 
 impl RenderState {
+    fn ensure_gpu(&mut self) -> anyhow::Result<()> {
+        if self.gpu.is_some() {
+            return Ok(());
+        }
+
+        let renderer = {
+            let mut shared = self
+                .renderer
+                .lock()
+                .map_err(|_| anyhow::anyhow!("renderer initialization lock poisoned"))?;
+            if let Some(renderer) = shared.as_ref() {
+                renderer.clone()
+            } else {
+                let renderer = tokio::runtime::Handle::current()
+                    .block_on(Renderer::new())
+                    .map_err(|e| anyhow::anyhow!("GPU init failed: {e}"))?;
+                let renderer = std::sync::Arc::new(renderer);
+                *shared = Some(renderer.clone());
+                renderer
+            }
+        };
+
+        let window_handle = WaylandWindow {
+            display: self.display_ptr.0,
+            surface: self.raw_surface.0,
+        };
+        let wgpu_surface = renderer
+            .instance
+            .create_surface(&window_handle)
+            .map_err(|e| anyhow::anyhow!("wgpu surface creation failed: {e:?}"))?;
+        let formats = wgpu_surface.get_capabilities(&renderer.adapter).formats;
+        let format = formats
+            .iter()
+            .copied()
+            .find(|format| *format == wgpu::TextureFormat::Bgra8UnormSrgb)
+            .or_else(|| formats.into_iter().next())
+            .unwrap_or(wgpu::TextureFormat::Bgra8UnormSrgb);
+        wgpu_surface.configure(
+            &renderer.device,
+            &wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format,
+                width: self.width,
+                height: self.height,
+                present_mode: wgpu::PresentMode::Fifo,
+                alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+                view_formats: vec![],
+                desired_maximum_frame_latency: 1,
+            },
+        );
+        // SAFETY: the Wayland display and layer surface are retained by the
+        // daemon for the lifetime of this render state.
+        let wgpu_surface: wgpu::Surface<'static> = unsafe { std::mem::transmute(wgpu_surface) };
+        let surface: &'static wgpu::Surface<'static> = Box::leak(Box::new(wgpu_surface));
+        self.gpu = Some(GpuState {
+            renderer: renderer.clone(),
+            surface,
+            format,
+            per_output_uniforms: std::sync::Arc::new(renderer.create_per_output_uniforms()),
+        });
+        Ok(())
+    }
+
     fn set_wallpaper(
         &mut self,
         path: &std::path::Path,
@@ -843,12 +944,164 @@ impl RenderState {
         duration_ms: u32,
         scaling_mode: u32,
     ) -> anyhow::Result<()> {
+        // Setting the already-active source is an idempotent operation. Do
+        // not decode it, allocate another GPU texture, or enqueue another
+        // transition merely because a watcher/IPC client repeated the same
+        // request. This is especially important for bursty wallpaper
+        // scripts, where the no-op path should be effectively free.
+        if !self.blanked
+            && (self.current_bind.is_some() || self.shm_buffer.is_some())
+            && self.last_wallpaper.as_deref() == Some(path)
+            && self.scaling_mode == scaling_mode
+            && self.current_effect.as_ref() == Some(effect)
+        {
+            return Ok(());
+        }
+        // A zero-duration static commit does not need a shader or a swapchain
+        // frame. Hand the pixels directly to the compositor and release the
+        // persistent GPU image, matching the low-idle-cost architecture used
+        // by dedicated static wallpaper daemons.
+        let is_animated_image = matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("gif" | "GIF" | "apng" | "APNG")
+        );
+        if duration_ms == 0
+            && !is_animated_image
+            && !crate::video::VideoDecoder::is_video_file(path)
+            && !self.gpu_surface_used
+            && self.commit_static_shm(path, scaling_mode)?
+        {
+            self.playback_gen.fetch_add(1, Ordering::SeqCst);
+            self.pacer.notify();
+            self.video_playback.stop();
+            self.current_bind = None;
+            self.current_tex = None;
+            self.current_width = 0;
+            self.current_height = 0;
+            self.scaling_mode = scaling_mode;
+            self.current_effect = Some(effect.clone());
+            self.last_wallpaper = Some(path.to_path_buf());
+            self.blanked = false;
+            // Dropping the old bind group/texture is enough to release the
+            // Rust-side ownership. A blocking device drain here makes every
+            // static switch wait for unrelated GPU work even though the new
+            // frame is already compositor-owned through wl_shm. The render
+            // path polls when it actually needs synchronization.
+            return Ok(());
+        }
+        self.ensure_gpu()?;
         let commit = self.commit_wallpaper(path, scaling_mode)?;
+        self.gpu_surface_used = true;
         self.scaling_mode = scaling_mode;
+        self.current_effect = Some(effect.clone());
         self.spawn_transition(commit, effect, duration_ms);
         // Update last_wallpaper after successful commit
         self.last_wallpaper = Some(path.to_path_buf());
         Ok(())
+    }
+
+    fn commit_static_shm(
+        &mut self,
+        path: &std::path::Path,
+        scaling_mode: u32,
+    ) -> anyhow::Result<bool> {
+        use image::{ImageDecoder, ImageReader};
+
+        // The wgpu transition task and the wl_shm fast path target the same
+        // layer surface. Serialize the protocol commit so a static switch
+        // cannot race an in-flight GPU present.
+        // A transition can be parked indefinitely in FIFO present while a
+        // compositor is suspended or a monitor is disabled. Never make an
+        // IPC/static switch wait behind that task: fall back to the normal
+        // GPU commit, which promotes the new generation and lets the stale
+        // transition exit before it renders again.
+        let Some(_render_guard) = self.render_lock.try_lock().ok() else {
+            return Ok(false);
+        };
+
+        let decoder = ImageReader::open(path)?.into_decoder()?;
+        let (source_width, source_height) = decoder.dimensions();
+        Renderer::validate_static_decode(source_width, source_height, decoder.total_bytes())?;
+        let image = image::DynamicImage::from_decoder(decoder)?;
+        let (rgba, width, height) = crate::renderer::prepare_image_rgba(
+            &image,
+            self.width,
+            self.height,
+            scaling_mode,
+            wgpu::Limits::default().max_texture_dimension_2d,
+        )?;
+        if width != self.width || height != self.height {
+            // wl_shm buffers are displayed at their native size. The GPU path
+            // remains responsible for center/tile and other non-fullscreen
+            // modes that cannot be represented by one compositor buffer.
+            return Ok(false);
+        }
+
+        let stride = width
+            .checked_mul(4)
+            .ok_or_else(|| anyhow::anyhow!("static image stride overflow"))?;
+        let buffer = if self.shm_width == width && self.shm_height == height {
+            if let Some(buffer) = self.shm_buffer.take() {
+                // A buffer may still be owned by the compositor after the
+                // previous commit. Keep the protocol object alive until its
+                // release event, but allocate a fresh slot for this update
+                // instead of falling back to the GPU path.
+                if buffer.canvas(&mut self.shm_pool).is_some() {
+                    buffer
+                } else {
+                    let (new_buffer, _) = self.shm_pool.create_buffer(
+                        width as i32,
+                        height as i32,
+                        stride as i32,
+                        wayland_client::protocol::wl_shm::Format::Xrgb8888,
+                    )?;
+                    drop(buffer);
+                    new_buffer
+                }
+            } else {
+                let (buffer, _) = self.shm_pool.create_buffer(
+                    width as i32,
+                    height as i32,
+                    stride as i32,
+                    wayland_client::protocol::wl_shm::Format::Xrgb8888,
+                )?;
+                buffer
+            }
+        } else {
+            let (buffer, _) = self.shm_pool.create_buffer(
+                width as i32,
+                height as i32,
+                stride as i32,
+                wayland_client::protocol::wl_shm::Format::Xrgb8888,
+            )?;
+            buffer
+        };
+        let canvas = buffer
+            .canvas(&mut self.shm_pool)
+            .ok_or_else(|| anyhow::anyhow!("shared-memory wallpaper buffer is still active"))?;
+        for (src, dst) in rgba
+            .as_raw()
+            .chunks_exact(4)
+            .zip(canvas.chunks_exact_mut(4))
+        {
+            // XRGB8888 is stored as B,G,R,X on little-endian Wayland hosts.
+            // Write channels directly so the hot conversion loop does not
+            // construct a temporary slice for every pixel.
+            dst[0] = src[2];
+            dst[1] = src[1];
+            dst[2] = src[0];
+            dst[3] = 0xff;
+        }
+        buffer
+            .attach_to(&self.shm_surface)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.shm_surface
+            .damage_buffer(0, 0, width as i32, height as i32);
+        self.shm_surface.commit();
+        self.shm_buffer = Some(buffer);
+        self.shm_width = width;
+        self.shm_height = height;
+        Ok(true)
     }
 
     /// Loads the new wallpaper and atomically promotes it to the current
@@ -860,13 +1113,17 @@ impl RenderState {
         scaling_mode: u32,
     ) -> anyhow::Result<CommitData> {
         use image::{ImageDecoder, ImageReader};
+        let gpu = self
+            .gpu
+            .as_ref()
+            .expect("GPU state required for dynamic content");
 
         // Check if this is a video file FIRST
         if crate::video::VideoDecoder::is_video_file(path) {
             tracing::info!("Video file detected: {:?}", path);
 
             let generation = self.playback_gen.load(Ordering::SeqCst).wrapping_add(1);
-            let renderer = self.renderer.clone();
+            let renderer = gpu.renderer.clone();
             // Prepare and validate the new decoder before replacing active
             // playback. A failed video therefore leaves the old wallpaper and
             // decoder untouched.
@@ -888,9 +1145,9 @@ impl RenderState {
                 .as_ref()
                 .map(|frame| (frame.width, frame.height))
                 .unwrap_or((metadata.width, metadata.height));
-            let video_texture = self.renderer.create_video_texture(tex_width, tex_height)?;
+            let video_texture = gpu.renderer.create_video_texture(tex_width, tex_height)?;
             let (img_width, img_height) = if let Some(frame) = first_frame {
-                self.renderer
+                gpu.renderer
                     .update_video_texture(&video_texture, &frame.data)?;
                 (frame.width, frame.height)
             } else {
@@ -925,7 +1182,7 @@ impl RenderState {
                 img_height,
                 old_img_width,
                 old_img_height,
-                format: self.format,
+                format: gpu.format,
                 width: self.width,
                 height: self.height,
                 animated: None,
@@ -942,10 +1199,10 @@ impl RenderState {
         let mut animated = crate::animated::AnimatedImage::decode(path)?;
         let (new_tex, new_bind, img_width, img_height) = if let Some(anim) = animated.as_mut() {
             let (w, h) = (anim.width, anim.height);
-            let (tex, bind) = self.renderer.create_texture(w, h)?;
+            let (tex, bind) = gpu.renderer.create_texture(w, h)?;
             let first = anim.first_frame();
             if !first.is_empty() {
-                self.renderer.update_texture(&tex, first, w, h);
+                gpu.renderer.update_texture(&tex, first, w, h);
             }
             (tex, bind, w, h)
         } else {
@@ -954,7 +1211,7 @@ impl RenderState {
             Renderer::validate_static_decode(source_width, source_height, decoder.total_bytes())?;
             let new_img = image::DynamicImage::from_decoder(decoder)?;
             let (tex, bind, width, height) =
-                self.renderer
+                gpu.renderer
                     .load_texture(&new_img, self.width, self.height, scaling_mode)?;
             (tex, bind, width, height)
         };
@@ -991,7 +1248,7 @@ impl RenderState {
             img_height,
             old_img_width,
             old_img_height,
-            format: self.format,
+            format: gpu.format,
             width: self.width,
             height: self.height,
             animated,
@@ -1013,13 +1270,17 @@ impl RenderState {
         effect: &crate::animation::Effect,
         duration_ms: u32,
     ) {
-        let renderer = self.renderer.clone();
-        let surface: &'static wgpu::Surface<'static> = self.surface;
+        let gpu = self
+            .gpu
+            .as_ref()
+            .expect("GPU state required for transitions");
+        let renderer = gpu.renderer.clone();
+        let surface: &'static wgpu::Surface<'static> = gpu.surface;
         let render_lock = self.render_lock.clone();
         let playback_gen = self.playback_gen.clone();
         let pacer = self.pacer.clone();
         let video_playback = self.video_playback.clone();
-        let per_output_uniforms = std::sync::Arc::clone(&self.per_output_uniforms);
+        let per_output_uniforms = std::sync::Arc::clone(&gpu.per_output_uniforms);
         let gif_paused = self.gif_paused.clone();
         let effect = effect.clone();
         drop(tokio::task::spawn_blocking(move || {
@@ -1047,12 +1308,16 @@ async fn restore_cached_wallpaper(name: &str, render_state: &Arc<Mutex<RenderSta
     };
 
     let effect = crate::animation::Effect::Fade(crate::animation::FadeParams::default());
-    if let Err(err) = set_wallpaper_with_retry(render_state, &path, &effect, 1000, 0).await {
+    // Restoring a cached static wallpaper does not need an entrance
+    // transition. Avoid decoding/uploading a temporary GPU frame at daemon
+    // startup; static images can settle directly through the zero-duration
+    // path, while GIF/video inputs still select their dynamic pipeline.
+    if let Err(err) = set_wallpaper_with_retry(render_state, &path, &effect, 0, 0).await {
         tracing::warn!("Failed to restore wallpaper for {name} from {path:?}: {err}");
         let Some(previous) = read_wallpaper_state(&state_root, "previous_wallpaper", name) else {
             return;
         };
-        match set_wallpaper_with_retry(render_state, &previous, &effect, 1000, 0).await {
+        match set_wallpaper_with_retry(render_state, &previous, &effect, 0, 0).await {
             Ok(()) => {
                 if let Err(persist_err) =
                     write_wallpaper_state(&state_root, "last_wallpaper", name, &previous)
@@ -1073,6 +1338,10 @@ async fn restore_cached_wallpaper(name: &str, render_state: &Arc<Mutex<RenderSta
 
 const WALLPAPER_RETRY_ATTEMPTS: usize = 3;
 const WALLPAPER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+/// `SlotPool` grows automatically when a buffer does not fit. Keep daemon
+/// startup cheap instead of reserving a full output-sized shm mapping before
+/// the first static wallpaper is requested.
+const INITIAL_SHM_POOL_BYTES: usize = 4096;
 
 async fn set_wallpaper_with_retry(
     render_state: &Arc<Mutex<RenderState>>,
@@ -1220,7 +1489,7 @@ fn persist_wallpaper_at(
 /// Presents one frame per vsync until the wall-clock duration elapses. With
 /// PresentMode::Fifo, `get_current_texture` blocks until the previous frame
 /// is presented, so this loop is paced to the monitor refresh rate, and the
-/// transition lasts exactly `duration_ms` on any refresh rate — frame-count
+/// transition lasts exactly `duration_ms` on any refresh rate - frame-count
 /// pacing would run too fast on high-refresh panels and too slow when the
 /// present rate is low. If the compositor stops presenting, the loop can park
 /// inside a present; that is fine here because the task is detached.
@@ -1238,6 +1507,13 @@ fn render_transition(
     duration_ms: u32,
     per_output_uniforms: &crate::renderer::PerOutputUniforms,
 ) {
+    // Do this check before taking the render lock. Rapid IPC updates can
+    // otherwise queue several detached tasks, each retaining a complete
+    // incoming/outgoing GPU resource pair while waiting for its turn.
+    if playback_gen.load(Ordering::Acquire) != commit.generation {
+        reclaim_commit_resources(&renderer, commit);
+        return;
+    }
     let _guard = render_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1245,6 +1521,14 @@ fn render_transition(
     let duration = std::time::Duration::from_millis(u64::from(duration_ms.max(1)));
     let start = std::time::Instant::now();
     loop {
+        // A newer commit owns the output now. Abort before doing any more
+        // CPU/GPU work so superseded transitions release their bind groups,
+        // textures, and task stack immediately instead of queueing behind the
+        // render lock for the full transition duration.
+        if playback_gen.load(Ordering::Acquire) != commit.generation {
+            reclaim_commit_resources(&renderer, commit);
+            return;
+        }
         let progress = start.elapsed().as_secs_f32() / duration.as_secs_f32();
         let uniforms = crate::animation::compute_effect_uniforms(&effect, progress.clamp(0.0, 1.0));
         let status = renderer.render_frame(
@@ -1293,7 +1577,7 @@ fn render_transition(
                         present_mode: wgpu::PresentMode::Fifo,
                         alpha_mode: wgpu::CompositeAlphaMode::Opaque,
                         view_formats: vec![],
-                        desired_maximum_frame_latency: 2,
+                        desired_maximum_frame_latency: 1,
                     },
                 );
             }
@@ -1328,6 +1612,15 @@ fn render_transition(
             per_output_uniforms,
         );
     }
+    // Ensure resources from a completed static transition, or a live player
+    // that just stopped, are handed back to the backend before the detached
+    // task disappears. This is intentionally outside the frame hot path.
+    reclaim_commit_resources(&renderer, commit);
+}
+
+fn reclaim_commit_resources(renderer: &Renderer, commit: CommitData) {
+    drop(commit);
+    renderer.device.poll(wgpu::Maintain::Wait);
 }
 
 /// Presents live wallpaper frames until the next commit. One frame is
@@ -1462,32 +1755,12 @@ fn play_live(
 
         // Check if paused - if so, keep presenting the current frame but don't advance
         if gif_paused.load(Ordering::SeqCst) {
+            // The compositor retains the last committed buffer. Re-presenting
+            // an identical frame while paused only burns CPU/GPU time and
+            // wakes laptops needlessly. Park until resume or a replacement
+            // wallpaper notifies the shared pacer.
             let pause_start = std::time::Instant::now();
-            // Keep presenting the current frame while paused
-            let uniforms = crate::animation::compute_effect_uniforms(&static_effect, 1.0);
-            let status = renderer.render_frame(
-                crate::renderer::FrameRequest {
-                    surface,
-                    format: commit.format,
-                    bg_bind: &binds[cur],
-                    new_bind: &binds[cur],
-                    effect: &uniforms,
-                    width: commit.width,
-                    height: commit.height,
-                    img_width: animated.width,
-                    img_height: animated.height,
-                    old_img_width: animated.width,
-                    old_img_height: animated.height,
-                    scaling_mode: commit.scaling_mode,
-                },
-                per_output_uniforms,
-            );
-            match status {
-                Ok(crate::renderer::FrameStatus::Presented) => {}
-                _ => return,
-            }
-            // Wait a bit before checking again
-            std::thread::sleep(std::time::Duration::from_millis(16));
+            pacer.wait_until(std::time::Instant::now() + std::time::Duration::from_secs(86_400));
             paused_elapsed += pause_start.elapsed();
             continue;
         }
@@ -1686,7 +1959,7 @@ fn play_video(
                             present_mode: wgpu::PresentMode::Fifo,
                             alpha_mode: wgpu::CompositeAlphaMode::Opaque,
                             view_formats: vec![],
-                            desired_maximum_frame_latency: 2,
+                            desired_maximum_frame_latency: 1,
                         },
                     );
                 }
@@ -1888,10 +2161,6 @@ impl Daemon {
             let _ = std::fs::remove_file(&socket_path);
         }
 
-        let renderer = Renderer::new()
-            .await
-            .map_err(|e| DaemonError::StartError(format!("GPU init failed: {e}")))?;
-
         let conn = Connection::connect_to_env()
             .map_err(|e| DaemonError::StartError(format!("Failed to connect to Wayland: {e:?}")))?;
         let backend = conn.backend();
@@ -1966,12 +2235,13 @@ impl Daemon {
                 .collect::<Vec<_>>()
         );
 
-        let renderer = std::sync::Arc::new(renderer);
+        let renderer: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<Renderer>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
 
         // Create a LayerSurface, wgpu Surface, and RenderState for every
         // known output. The key is the output's human-readable name (e.g.
         // "DP-1", "eDP-1") so IPC can target a specific monitor.
-        let render_states_map: std::collections::HashMap<String, Arc<Mutex<RenderState>>> =
+        let mut render_states_map: std::collections::HashMap<String, Arc<Mutex<RenderState>>> =
             std::collections::HashMap::new();
 
         // Collect output info first so we can pass &mut wayland_state to the
@@ -2005,6 +2275,7 @@ impl Daemon {
             )
             .await?;
             let rs = Arc::new(Mutex::new(rs));
+            render_states_map.insert(name.clone(), rs.clone());
             wayland_state.output_lifecycles.insert(
                 *proto_id,
                 OutputLifecycle {
@@ -2124,6 +2395,7 @@ impl Daemon {
                             let rs_lock = rs.lock().await;
                             rs_lock.video_playback.resume();
                             rs_lock.gif_paused.store(false, Ordering::SeqCst);
+                            rs_lock.pacer.notify();
                         }
                         IpcResponse {
                             success: true,
@@ -2420,8 +2692,14 @@ impl Daemon {
                         // Collect target output info
                         for (name, rs) in &targets {
                             let rs_lock = rs.lock().await;
-                            let gpu_info =
-                                crate::video::gpu::adapter_diagnostics(&rs_lock.renderer.adapter);
+                            let gpu_info = crate::video::gpu::adapter_diagnostics(
+                                &rs_lock
+                                    .gpu
+                                    .as_ref()
+                                    .expect("GPU state required")
+                                    .renderer
+                                    .adapter,
+                            );
 
                             lines.push(String::new());
                             lines.push(format!("[{name}] {}x{}", rs_lock.width, rs_lock.height));
@@ -2821,7 +3099,7 @@ impl Daemon {
     /// Wayland output.
     #[allow(clippy::too_many_arguments)]
     async fn create_render_state_for_output(
-        renderer: &std::sync::Arc<Renderer>,
+        renderer: &std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<Renderer>>>>,
         display_ptr: *mut std::ffi::c_void,
         wayland_state: &mut WaylandState,
         qh: &QueueHandle<WaylandState>,
@@ -2869,57 +3147,14 @@ impl Daemon {
         let height = output.height;
 
         let raw_surface = layer_surface.wl_surface().id().as_ptr() as *mut std::ffi::c_void;
+        let shm_surface = layer_surface.wl_surface().clone();
         wayland_state.surfaces.push((output_id, layer_surface));
 
-        let window_handle = WaylandWindow {
-            display: display_ptr,
-            surface: raw_surface,
-        };
-
-        let wgpu_surface = renderer
-            .instance
-            .create_surface(&window_handle)
-            .map_err(|e| DaemonError::StartError(format!("wgpu surface creation failed: {e:?}")))?;
-
-        let adapter = renderer
-            .instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                compatible_surface: Some(&wgpu_surface),
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-            })
-            .await;
-        let surf_format = adapter
-            .as_ref()
-            .map(|a| {
-                let caps = wgpu_surface.get_capabilities(a);
-                caps.formats
-                    .into_iter()
-                    .next()
-                    .unwrap_or(wgpu::TextureFormat::Bgra8UnormSrgb)
-            })
-            .unwrap_or(wgpu::TextureFormat::Bgra8UnormSrgb);
-
-        let surf_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surf_format,
-            width,
-            height,
-            present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-        wgpu_surface.configure(&renderer.device, &surf_config);
-
-        // SAFETY: The surface is tied to wayland_state + window_handle, both
-        // of which live for the entire process.
-        let wgpu_surface: wgpu::Surface<'static> = unsafe { std::mem::transmute(wgpu_surface) };
-        let surface: &'static wgpu::Surface<'static> = Box::leak(Box::new(wgpu_surface));
-
         Ok(RenderState {
+            gpu: None,
             renderer: renderer.clone(),
-            surface,
+            display_ptr: SendDisplayPtr(display_ptr),
+            raw_surface: SendDisplayPtr(raw_surface),
             render_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             playback_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pacer: std::sync::Arc::new(LivePacer::new()),
@@ -2929,17 +3164,24 @@ impl Daemon {
             height,
             current_width: 0,
             current_height: 0,
-            format: surf_format,
             video_playback: std::sync::Arc::new(crate::video::VideoPlayback::new()),
             hw_accel: crate::video::HwAccel::from_config(&config.video.hw_decode),
             preload_frames: clamp_preload_frames(config.video.preload_frames),
             max_fps: clamp_max_fps(config.daemon.max_fps),
             scaling_mode: 0,
-            per_output_uniforms: std::sync::Arc::new(renderer.create_per_output_uniforms()),
+            current_effect: None,
             last_wallpaper: None,
             pre_blank: None,
             blanked: false,
             gif_paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shm_surface,
+            shm_pool: SlotPool::new(INITIAL_SHM_POOL_BYTES, &wayland_state.shm).map_err(|e| {
+                DaemonError::StartError(format!("shared-memory pool creation failed: {e}"))
+            })?,
+            shm_buffer: None,
+            shm_width: 0,
+            shm_height: 0,
+            gpu_surface_used: false,
         })
     }
 }
@@ -2949,7 +3191,7 @@ impl Daemon {
 /// new one, avoiding the async requirement.
 #[allow(clippy::too_many_arguments)]
 fn create_render_state_for_output_sync(
-    renderer: &std::sync::Arc<Renderer>,
+    renderer: &std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<Renderer>>>>,
     display_ptr: *mut std::ffi::c_void,
     wayland_state: &mut WaylandState,
     qh: &QueueHandle<WaylandState>,
@@ -2996,44 +3238,14 @@ fn create_render_state_for_output_sync(
     let height = output.height;
 
     let raw_surface = layer_surface.wl_surface().id().as_ptr() as *mut std::ffi::c_void;
+    let shm_surface = layer_surface.wl_surface().clone();
     wayland_state.surfaces.push((output_id, layer_surface));
 
-    let window_handle = WaylandWindow {
-        display: display_ptr,
-        surface: raw_surface,
-    };
-
-    let wgpu_surface = renderer
-        .instance
-        .create_surface(&window_handle)
-        .map_err(|e| DaemonError::StartError(format!("wgpu surface creation failed: {e:?}")))?;
-
-    let surf_format = {
-        let caps = wgpu_surface.get_capabilities(&renderer.adapter);
-        caps.formats
-            .into_iter()
-            .next()
-            .unwrap_or(wgpu::TextureFormat::Bgra8UnormSrgb)
-    };
-
-    let surf_config = wgpu::SurfaceConfiguration {
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        format: surf_format,
-        width,
-        height,
-        present_mode: wgpu::PresentMode::Fifo,
-        alpha_mode: wgpu::CompositeAlphaMode::Opaque,
-        view_formats: vec![],
-        desired_maximum_frame_latency: 2,
-    };
-    wgpu_surface.configure(&renderer.device, &surf_config);
-
-    let wgpu_surface: wgpu::Surface<'static> = unsafe { std::mem::transmute(wgpu_surface) };
-    let surface: &'static wgpu::Surface<'static> = Box::leak(Box::new(wgpu_surface));
-
     Ok(RenderState {
+        gpu: None,
         renderer: renderer.clone(),
-        surface,
+        display_ptr: SendDisplayPtr(display_ptr),
+        raw_surface: SendDisplayPtr(raw_surface),
         render_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         playback_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         pacer: std::sync::Arc::new(LivePacer::new()),
@@ -3043,16 +3255,23 @@ fn create_render_state_for_output_sync(
         height,
         current_width: 0,
         current_height: 0,
-        format: surf_format,
         video_playback: std::sync::Arc::new(crate::video::VideoPlayback::new()),
         hw_accel: crate::video::HwAccel::from_config(&config.video.hw_decode),
         preload_frames: clamp_preload_frames(config.video.preload_frames),
         max_fps: clamp_max_fps(config.daemon.max_fps),
         scaling_mode: 0,
-        per_output_uniforms: std::sync::Arc::new(renderer.create_per_output_uniforms()),
+        current_effect: None,
         last_wallpaper: None,
         pre_blank: None,
         blanked: false,
         gif_paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        shm_surface,
+        shm_pool: SlotPool::new(INITIAL_SHM_POOL_BYTES, &wayland_state.shm).map_err(|e| {
+            DaemonError::StartError(format!("shared-memory pool creation failed: {e}"))
+        })?,
+        shm_buffer: None,
+        shm_width: 0,
+        shm_height: 0,
+        gpu_surface_used: false,
     })
 }

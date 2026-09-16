@@ -155,14 +155,27 @@ impl Default for Uniforms {
 
 impl Renderer {
     pub async fn new() -> anyhow::Result<Self> {
+        // A Wayland wallpaper daemon on Linux only needs the native Linux GPU
+        // backends. `Backends::all()` also probes browser/mobile/Apple
+        // backends that cannot produce a Wayland surface here, increasing
+        // startup work and sometimes loading unnecessary driver state. Keep
+        // Vulkan as the primary path and OpenGL as a compatibility fallback.
+        #[cfg(target_os = "linux")]
+        let backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
+        #[cfg(not(target_os = "linux"))]
+        let backends = wgpu::Backends::all();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends,
             ..Default::default()
         });
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
+                // A wallpaper is a persistent background workload. Prefer
+                // the power-efficient adapter so an integrated GPU is used
+                // when available; this avoids waking a discrete GPU and
+                // keeps idle power and driver allocations low on laptops.
+                power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: None,
                 force_fallback_adapter: false,
             })
@@ -181,7 +194,11 @@ impl Renderer {
                     label: None,
                     required_features: wgpu::Features::empty(),
                     required_limits,
-                    memory_hints: wgpu::MemoryHints::default(),
+                    // Wallr is a persistent background process, not a game:
+                    // prefer smaller allocations and lower residency over
+                    // speculative throughput. Frame pacing remains governed
+                    // by FIFO presentation and the compositor.
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
                 },
                 None,
             )
@@ -328,8 +345,8 @@ impl Renderer {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         let video_plane_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -348,8 +365,8 @@ impl Renderer {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 
@@ -446,7 +463,7 @@ impl Renderer {
                     topology: wgpu::PrimitiveTopology::TriangleList,
                     strip_index_format: None,
                     front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None, // Don't cull — fullscreen quad
+                    cull_mode: None, // Don't cull - fullscreen quad
                     polygon_mode: wgpu::PolygonMode::Fill,
                     unclipped_depth: false,
                     conservative: false,
@@ -775,6 +792,72 @@ impl Renderer {
         Ok((texture, bind_group, width, height))
     }
 
+    /// Prepare pixels for a compositor-owned shared-memory buffer. This is
+    /// the static-image counterpart to `load_texture`: it applies the same
+    /// output-aware sizing policy without allocating a GPU texture.
+    pub fn prepare_image_rgba(
+        &self,
+        image: &image::DynamicImage,
+        output_width: u32,
+        output_height: u32,
+        scaling_mode: u32,
+    ) -> anyhow::Result<(image::RgbaImage, u32, u32)> {
+        prepare_image_rgba(
+            image,
+            output_width,
+            output_height,
+            scaling_mode,
+            self.device.limits().max_texture_dimension_2d,
+        )
+    }
+}
+
+/// Prepare compositor-owned static pixels without requiring a live GPU
+/// renderer. Keeping this operation independent is the first boundary for
+/// lazy GPU initialization: `wl_shm` outputs can decode and size static
+/// wallpapers before any wgpu device is created.
+pub fn prepare_image_rgba(
+    image: &image::DynamicImage,
+    output_width: u32,
+    output_height: u32,
+    scaling_mode: u32,
+    max_texture_dimension: u32,
+) -> anyhow::Result<(image::RgbaImage, u32, u32)> {
+    let (width, height) = prepared_image_dimensions(
+        image.width(),
+        image.height(),
+        output_width,
+        output_height,
+        scaling_mode,
+        max_texture_dimension,
+    );
+    let rgba = if (width, height) == image.dimensions() {
+        image.to_rgba8()
+    } else {
+        // Use the SIMD-capable resizer for the expensive downscale path. It
+        // preserves the existing Lanczos3 quality while avoiding the slower
+        // scalar imageops implementation for 4K-to-output conversions.
+        let source = image.to_rgba8();
+        let source_view = fast_image_resize::images::ImageRef::new(
+            source.width(),
+            source.height(),
+            source.as_raw(),
+            fast_image_resize::PixelType::U8x4,
+        )?;
+        let mut destination = fast_image_resize::images::Image::new(
+            width,
+            height,
+            fast_image_resize::PixelType::U8x4,
+        );
+        let mut resizer = fast_image_resize::Resizer::new();
+        resizer.resize(&source_view, &mut destination, None)?;
+        image::RgbaImage::from_raw(width, height, destination.into_vec())
+            .ok_or_else(|| anyhow::anyhow!("resizer returned an invalid RGBA buffer"))?
+    };
+    Ok((rgba, width, height))
+}
+
+impl Renderer {
     pub fn update_uniforms(&self, buffer: &wgpu::Buffer, uniforms: Uniforms) {
         self.queue
             .write_buffer(buffer, 0, bytemuck::cast_slice(&[uniforms]));

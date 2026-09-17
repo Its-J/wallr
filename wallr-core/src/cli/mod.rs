@@ -180,24 +180,6 @@ pub enum Commands {
         effect_args: EffectArgs,
     },
 
-    /// Alias for `set`
-    #[command(hide = true)]
-    Img {
-        path: PathBuf,
-        #[arg(long)]
-        animation: Option<String>,
-        #[arg(short = 'm', long)]
-        monitor: Option<String>,
-        #[arg(long, value_enum)]
-        mode: Option<ScalingMode>,
-        #[arg(long)]
-        no_theme: bool,
-        #[arg(short = 't', long, value_enum)]
-        theme: Option<ThemeProvider>,
-        #[command(flatten)]
-        effect_args: EffectArgs,
-    },
-
     /// Run system and dependency diagnostics
     Doctor,
 

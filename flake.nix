@@ -16,6 +16,7 @@
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
         rustToolchain = pkgs.rust-bin.stable.latest.default;
+        llvmPackages = pkgs.llvmPackages;
       in
       {
         packages = {
@@ -29,6 +30,7 @@
             nativeBuildInputs = [
               rustToolchain
               pkgs.pkg-config
+              llvmPackages.libclang
             ];
 
             buildInputs = [
@@ -39,6 +41,8 @@
 
             # Skip tests that require a Wayland compositor
             doCheck = false;
+
+            LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
 
             meta = with pkgs.lib; {
               description = "GPU-accelerated wallpaper engine for Wayland";
@@ -60,8 +64,10 @@
             pkgs.rust-analyzer
             pkgs.clippy
             pkgs.rustfmt
+            llvmPackages.libclang
           ];
 
+          LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
         };
       });

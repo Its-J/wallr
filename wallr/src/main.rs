@@ -107,16 +107,7 @@ async fn async_main() -> Result<()> {
     let config = config::load_config(config_path)?;
 
     match cli.command {
-        Commands::Img {
-            path,
-            no_theme,
-            theme,
-            monitor,
-            animation,
-            mode,
-            effect_args,
-        }
-        | Commands::Set {
+        Commands::Set {
             path,
             no_theme,
             theme,
